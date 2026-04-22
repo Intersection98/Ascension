@@ -1,0 +1,776 @@
+import type { CardDefinition, CardInstance, CardType, Effect, Faction } from './types'
+
+export const cardDefinitions: CardDefinition[] = [
+  {
+    id: 'apprentice',
+    name: '学徒',
+    type: 'hero',
+    faction: 'neutral',
+    cost: 0,
+    honor: 0,
+    copies: 0,
+    description: '+1 符文',
+    effects: [{ type: 'runes', amount: 1 }],
+  },
+  {
+    id: 'militia',
+    name: '民兵',
+    type: 'hero',
+    faction: 'neutral',
+    cost: 0,
+    honor: 0,
+    copies: 0,
+    description: '+1 力量',
+    effects: [{ type: 'power', amount: 1 }],
+  },
+  {
+    id: 'mystic',
+    name: '秘法师',
+    type: 'hero',
+    faction: 'neutral',
+    cost: 3,
+    honor: 1,
+    copies: 0,
+    description: '+2 符文',
+    effects: [{ type: 'runes', amount: 2 }],
+  },
+  {
+    id: 'heavy-infantry',
+    name: '重装步兵',
+    type: 'hero',
+    faction: 'neutral',
+    cost: 2,
+    honor: 1,
+    copies: 0,
+    description: '+2 力量',
+    effects: [{ type: 'power', amount: 2 }],
+  },
+  {
+    id: 'cultist',
+    name: '邪教徒',
+    type: 'monster',
+    faction: 'void',
+    cost: 2,
+    honor: 0,
+    copies: 0,
+    description: '击败：获得 1 荣誉',
+    effects: [],
+    defeatEffects: [{ type: 'honor', amount: 1 }],
+  },
+  // 怪物
+  {
+    id: 'incarnation-of-the-fallen-god',
+    name: '堕落之神的化身',
+    type: 'monster',
+    faction: 'void',
+    cost: 7,
+    honor: 0,
+    copies: 1,
+    description: '不可被放逐。击败：获得 4 荣誉。你可以免费获得中央排列的任意卡牌或击败任意怪物。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 4 },
+      { type: 'acquire_any_center_card', optional: true },
+      { type: 'defeat_any_monster', optional: true },
+    ],
+  },
+  {
+    id: 'corrosive-widow',
+    name: '蚀寡妇',
+    type: 'monster',
+    faction: 'void',
+    cost: 4,
+    honor: 0,
+    copies: 4,
+    description: '击败：获得 3 荣誉。每一个对手必须弃掉一个他选择的已装备的神器。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 3 },
+      { type: 'opponent_discard_artifact', amount: 1 },
+    ],
+  },
+  {
+    id: 'tyrant-of-the-earth',
+    name: '地之暴君',
+    type: 'monster',
+    faction: 'void',
+    cost: 6,
+    honor: 0,
+    copies: 2,
+    description: '击败：获得 5 荣誉。抽两张牌。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 5 },
+      { type: 'draw', amount: 2 },
+    ],
+  },
+  {
+    id: 'demon-bat',
+    name: '魔蝠',
+    type: 'monster',
+    faction: 'void',
+    cost: 3,
+    honor: 0,
+    copies: 3,
+    description: '击败：获得 2 荣誉。你可以放逐中央牌堆的一张牌。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 2 },
+      { type: 'banish_center_row', amount: 1, optional: true },
+    ],
+  },
+  {
+    id: 'false-creation',
+    name: '错误的造物',
+    type: 'monster',
+    faction: 'void',
+    cost: 4,
+    honor: 0,
+    copies: 4,
+    description: '击败：获得 4 荣誉。你可以放逐中央牌堆的一张牌和/或放逐你弃牌堆的一张牌。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 4 },
+      { type: 'banish_center_row', amount: 1, optional: true },
+      { type: 'banish_hand_discard', amount: 1, optional: true },
+    ],
+  },
+  {
+    id: 'samuel-illusionist',
+    name: '萨麦尔幻化师',
+    type: 'monster',
+    faction: 'void',
+    cost: 3,
+    honor: 0,
+    copies: 4,
+    description: '击败：获得 2 荣誉和 1 符文。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 2 },
+      { type: 'runes', amount: 1 },
+    ],
+  },
+  {
+    id: 'tyrant-of-the-sea',
+    name: '海之暴君',
+    type: 'monster',
+    faction: 'void',
+    cost: 5,
+    honor: 0,
+    copies: 3,
+    description: '击败：获得 5 荣誉。每位对手如果操控的神器超过一个，则它必须从中选择一个并摧毁其他所有神器。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 5 },
+      { type: 'opponent_destroy_artifacts_except_one', optional: true },
+    ],
+  },
+  {
+    id: 'soul-of-agony',
+    name: '苦痛之魂',
+    type: 'monster',
+    faction: 'void',
+    cost: 3,
+    honor: 0,
+    copies: 3,
+    description: '击败：获得 3 荣誉。抽一张牌。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 3 },
+      { type: 'draw', amount: 1 },
+    ],
+  },
+  {
+    id: 'tyrant-of-the-wind',
+    name: '风之暴君',
+    type: 'monster',
+    faction: 'void',
+    cost: 5,
+    honor: 0,
+    copies: 3,
+    description: '击败：获得 3 荣誉和 3 符文。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 3 },
+      { type: 'runes', amount: 3 },
+    ],
+  },
+  {
+    id: 'heron-lord-of-lies',
+    name: '谎言公爵希戎',
+    type: 'monster',
+    faction: 'void',
+    cost: 6,
+    honor: 0,
+    copies: 1,
+    description: '击败：获得 4 荣誉。从每位对手的手牌中随机抽取一张并将这些卡牌放入你的手牌。',
+    effects: [],
+    defeatEffects: [
+      { type: 'honor', amount: 4 },
+      { type: 'steal_card_from_each_opponent', amount: 1 },
+    ],
+  },
+  // 圣贤
+  {
+    id: 'alola-disciple',
+    name: '阿罗拉门徒',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 1,
+    honor: 1,
+    copies: 3,
+    description: '抽一张牌。',
+    effects: [{ type: 'draw', amount: 1 }],
+  },
+  {
+    id: 'alola-knight',
+    name: '阿罗拉骑士',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 4,
+    honor: 3,
+    copies: 2,
+    description: '击败一个费用为 4 以下的怪物。',
+    effects: [{ type: 'defeat_monster_upto_cost', cost: 4 }],
+  },
+  {
+    id: 'lidless-eye-ascetic',
+    name: '裸眼苦修士',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 5,
+    honor: 3,
+    copies: 2,
+    description: '抽 2 张牌。',
+    effects: [{ type: 'draw', amount: 2 }],
+  },
+  {
+    id: 'master-dasa',
+    name: '大师达萨',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 7,
+    honor: 4,
+    copies: 1,
+    description: '抽 3 张牌。',
+    effects: [{ type: 'draw', amount: 3 }],
+  },
+  {
+    id: 'ozai-the-unparalleled',
+    name: '无双的奥扎',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 6,
+    honor: 3,
+    copies: 1,
+    description: '击败一个费用为 6 以下的怪物。',
+    effects: [{ type: 'defeat_monster_upto_cost', cost: 6 }],
+  },
+  {
+    id: 'prophet-of-the-forked-path',
+    name: '歧路先知',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 2,
+    honor: 1,
+    copies: 3,
+    description: '抽一张牌，你可以放逐中央牌堆的一张牌。',
+    effects: [
+      { type: 'draw', amount: 1 },
+      { type: 'banish_center_row', amount: 1, optional: true },
+    ],
+  },
+  {
+    id: 'temple-curator',
+    name: '圣殿馆长',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 2,
+    honor: 1,
+    copies: 3,
+    description: '弃一张牌，然后抽 2 张牌。',
+    effects: [{ type: 'discard_then_draw', discard: 1, draw: 2 }],
+  },
+  {
+    id: 'ascia-the-twinned',
+    name: '双生阿斯卡',
+    type: 'hero',
+    faction: 'enlightened',
+    cost: 4,
+    honor: 2,
+    copies: 1,
+    description: '复制一个这回合已经打出的英雄的效果。',
+    effects: [{ type: 'copy_hero_effect', optional: true }],
+  },
+  {
+    id: 'all-knowing-eye',
+    name: '全知之眼',
+    type: 'construct',
+    faction: 'enlightened',
+    cost: 6,
+    honor: 3,
+    copies: 1,
+    description: '每回合一次，抽一张牌。',
+    effects: [{ type: 'draw', amount: 1, oncePerTurn: true }],
+  },
+  {
+    id: 'tablet-of-temporal-dawn',
+    name: '时序黎明之碑',
+    type: 'construct',
+    faction: 'enlightened',
+    cost: 5,
+    honor: 3,
+    copies: 1,
+    description: '你可以摧毁这个神器在回合结束后获得一个额外回合。',
+    effects: [],
+    activatedDescription: '摧毁此神器：获得 1 个额外回合。',
+    activatedEffects: [{ type: 'extra_turn', amount: 1 }],
+    banishOnActivate: true,
+  },
+  // 命约
+  {
+    id: 'star-weaver',
+    name: '星辰织者',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 7,
+    honor: 4,
+    copies: 1,
+    description: '免费获得一个英雄并将它放到牌库顶。',
+    effects: [
+      {
+        type: 'acquire_from_center',
+        cardTypes: ['hero'],
+        destination: 'top_deck',
+        optional: false,
+      },
+    ],
+  },
+  {
+    id: 'stone-circle-druid',
+    name: '石环德鲁伊',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 4,
+    honor: 3,
+    copies: 2,
+    description: '免费获得一个费用小于等于 4 的英雄并将它放到牌库顶。',
+    effects: [
+      {
+        type: 'acquire_from_center',
+        maxCost: 4,
+        cardTypes: ['hero'],
+        destination: 'top_deck',
+        optional: false,
+      },
+    ],
+  },
+  {
+    id: 'flytrap-witch',
+    name: '捕蝇草女巫',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 5,
+    honor: 2,
+    copies: 1,
+    description: '获得 2 点荣誉，抽一张牌。',
+    effects: [
+      { type: 'honor', amount: 2 },
+      { type: 'draw', amount: 1 },
+    ],
+  },
+  {
+    id: 'whispering-sage',
+    name: '低语贤者',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 5,
+    honor: 4,
+    copies: 1,
+    description: '+3 符文。',
+    effects: [{ type: 'runes', amount: 3 }],
+  },
+  {
+    id: 'lifebound-disciple',
+    name: '命约门徒',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 1,
+    honor: 1,
+    copies: 3,
+    description: '+1 符文，+1 荣誉。',
+    effects: [
+      { type: 'runes', amount: 1 },
+      { type: 'honor', amount: 1 },
+    ],
+  },
+  {
+    id: 'rune-lycanthrope',
+    name: '符文兽化者',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 3,
+    honor: 1,
+    copies: 2,
+    description: '+2 符文。联合：如果本回合已打出一个命约英雄，+2 力量。',
+    effects: [{ type: 'runes', amount: 2 }],
+    factionBonus: [{ type: 'power', amount: 2 }],
+  },
+  {
+    id: 'wolf-shaman',
+    name: '狼萨满',
+    type: 'hero',
+    faction: 'lifebound',
+    cost: 1,
+    honor: 1,
+    copies: 3,
+    description: '+1 符文，抽 1 张牌。',
+    effects: [
+      { type: 'runes', amount: 1 },
+      { type: 'draw', amount: 1 },
+    ],
+  },
+  {
+    id: 'dragon-eating-flower',
+    name: '噬龙花',
+    type: 'construct',
+    faction: 'lifebound',
+    cost: 5,
+    honor: 3,
+    copies: 2,
+    description: '每回合一次，+1 符文。联合：每回合一次，如果打出一个命约英雄，+1 荣誉。',
+    effects: [{ type: 'runes', amount: 1, oncePerTurn: true }],
+    factionBonus: [{ type: 'honor', amount: 1, oncePerTurn: true }],
+  },
+  {
+    id: 'world-tree-staff',
+    name: '世界之树手杖',
+    type: 'construct',
+    faction: 'lifebound',
+    cost: 4,
+    honor: 2,
+    copies: 2,
+    description: '每回合一次，+1 符文。每回合一次，你可以花费 4 点符文获得 3 点荣誉。',
+    effects: [{ type: 'runes', amount: 1, oncePerTurn: true }],
+    activatedDescription: '花费 4 符文：获得 3 荣誉。',
+    activatedEffects: [
+      {
+        type: 'spend_runes',
+        amount: 4,
+        effects: [{ type: 'honor', amount: 3 }],
+      },
+    ],
+  },
+  // 机械
+  {
+    id: 'avatar-golem',
+    name: '化身石像',
+    type: 'hero',
+    faction: 'mechana',
+    cost: 4,
+    honor: 2,
+    copies: 2,
+    description: '+2 符文。你每控制一种派系的神器，+1 荣誉。（派系包括圣贤、命约、机械、虚空四种）',
+    effects: [
+      { type: 'runes', amount: 2 },
+      { type: 'honor_per_artifact_faction', amount: 1 },
+    ],
+  },
+  {
+    id: 'coro-steel-artificer',
+    name: '钢铁术士寇罗',
+    type: 'hero',
+    faction: 'mechana',
+    cost: 3,
+    honor: 3,
+    copies: 1,
+    description: '+2 符文。如果你控制 2 个以上的神器，抽 1 张牌。',
+    effects: [
+      { type: 'runes', amount: 2 },
+      { type: 'draw', amount: 1, condition: 'has_artifacts', threshold: 2 },
+    ],
+  },
+  {
+    id: 'mechana-disciple',
+    name: '机械门徒',
+    type: 'hero',
+    faction: 'mechana',
+    cost: 1,
+    honor: 1,
+    copies: 3,
+    description: '+1 符文，+1 力量。',
+    effects: [
+      { type: 'runes', amount: 1 },
+      { type: 'power', amount: 1 },
+    ],
+  },
+  {
+    id: 'furnace-acolyte',
+    name: '熔炉侍僧',
+    type: 'hero',
+    faction: 'mechana',
+    cost: 4,
+    honor: 2,
+    copies: 2,
+    description: '+2 符文。下一次购买神器时花费的符文 -1。',
+    effects: [
+      { type: 'runes', amount: 2 },
+      { type: 'artifact_discount', amount: 1, duration: 'next_purchase' },
+    ],
+  },
+  {
+    id: 'excavator-mark-ii',
+    name: '挖掘机二型',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 3,
+    honor: 3,
+    copies: 2,
+    description: '每回合一次，打出机械神器时抽一张牌（包括本牌）。',
+    effects: [{ type: 'draw_on_mechana_construct_play', amount: 1, oncePerTurn: true }],
+  },
+  {
+    id: 'grand-design',
+    name: '大设计',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 6,
+    honor: 6,
+    copies: 2,
+    description: '每回合一次，+2 符文（只能用于购买机械神器）。',
+    effects: [{ type: 'runes_for_mechana_artifacts', amount: 2, oncePerTurn: true }],
+  },
+  {
+    id: 'hedron-cannon',
+    name: '希德伦加农炮',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 8,
+    honor: 8,
+    copies: 1,
+    description: '每回合一次，每控制 1 个机械神器就 +1 力量。',
+    effects: [{ type: 'power_per_mechana_artifact', oncePerTurn: true }],
+  },
+  {
+    id: 'hedron-linker',
+    name: '希德伦链接仪',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 7,
+    honor: 7,
+    copies: 1,
+    description: '将所有神器视为机械神器。',
+    effects: [{ type: 'all_artifacts_mechana' }],
+  },
+  {
+    id: 'rocket-messenger-x99',
+    name: '火箭信使x-99',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 4,
+    honor: 4,
+    copies: 2,
+    description: '每回合一次，当你购买机械神器的时候，你可以将其加入手牌。',
+    effects: [{ type: 'mechana_artifact_to_hand', oncePerTurn: true }],
+  },
+  {
+    id: 'clockmaker-altar',
+    name: '钟表师祭坛',
+    type: 'construct',
+    faction: 'mechana',
+    cost: 5,
+    honor: 5,
+    copies: 2,
+    description: '每回合一次，+1 符文（只能用于购买机械神器）。',
+    effects: [{ type: 'runes_for_mechana_artifacts', amount: 1, oncePerTurn: true }],
+  },
+  // 虚空
+  {
+    id: 'cliff-arbiter',
+    name: '断崖仲裁者',
+    type: 'hero',
+    faction: 'void',
+    cost: 5,
+    honor: 3,
+    copies: 2,
+    description: '抽两张牌，然后放逐一张手牌。',
+    effects: [
+      { type: 'draw', amount: 2 },
+      { type: 'banish_hand', amount: 1 },
+    ],
+  },
+  {
+    id: 'demon-slayer',
+    name: '屠魔者',
+    type: 'hero',
+    faction: 'void',
+    cost: 4,
+    honor: 2,
+    copies: 2,
+    description: '+3 力量。',
+    effects: [{ type: 'power', amount: 3 }],
+  },
+  {
+    id: 'eri-void-walker',
+    name: '虚空行者艾瑞',
+    type: 'hero',
+    faction: 'void',
+    cost: 6,
+    honor: 4,
+    copies: 1,
+    description: '+4 力量。',
+    effects: [{ type: 'power', amount: 4 }],
+  },
+  {
+    id: 'shadow-of-the-dark-watcher',
+    name: '黑暗守望者之影',
+    type: 'hero',
+    faction: 'void',
+    cost: 3,
+    honor: 1,
+    copies: 3,
+    description: '+2 力量。',
+    effects: [{ type: 'power', amount: 2 }],
+  },
+  {
+    id: 'spear-stab-yaksha',
+    name: '矛刺夜叉',
+    type: 'hero',
+    faction: 'void',
+    cost: 2,
+    honor: 1,
+    copies: 2,
+    description: '+1 力量，抽一张牌。',
+    effects: [
+      { type: 'power', amount: 1 },
+      { type: 'draw', amount: 1 },
+    ],
+  },
+  {
+    id: 'void-disciple',
+    name: '虚空门徒',
+    type: 'hero',
+    faction: 'void',
+    cost: 1,
+    honor: 1,
+    copies: 3,
+    description: '+1 符文。你可以放逐 1 张弃牌堆的牌或手牌。',
+    effects: [
+      { type: 'runes', amount: 1 },
+      { type: 'banish_hand_discard', amount: 1, optional: true },
+    ],
+  },
+  {
+    id: 'muramasa',
+    name: '妖刀村正',
+    type: 'construct',
+    faction: 'void',
+    cost: 7,
+    honor: 4,
+    copies: 1,
+    description: '每回合一次，+3 力量。',
+    effects: [{ type: 'power', amount: 3, oncePerTurn: true }],
+  },
+  {
+    id: 'shadow-star',
+    name: '暗影之星',
+    type: 'construct',
+    faction: 'void',
+    cost: 3,
+    honor: 2,
+    copies: 2,
+    description: '每回合一次，+1 力量。',
+    effects: [{ type: 'power', amount: 1, oncePerTurn: true }],
+  },
+  {
+    id: 'void-hungerer',
+    name: '虚空渴望者',
+    type: 'construct',
+    faction: 'void',
+    cost: 5,
+    honor: 3,
+    copies: 2,
+    description: '每回合一次，+1 力量。每回合首次击败怪物时，+1 荣誉。',
+    effects: [
+      { type: 'power', amount: 1, oncePerTurn: true },
+      { type: 'honor_on_first_monster_defeat', amount: 1, oncePerTurn: true },
+    ],
+  },
+]
+
+export const cardsById = Object.fromEntries(
+  cardDefinitions.map((card) => [card.id, card]),
+) as Record<string, CardDefinition>
+
+export const factionLabels: Record<Faction, string> = {
+  enlightened: '圣贤',
+  lifebound: '命约',
+  mechana: '机械',
+  void: '虚空',
+  neutral: '中立',
+}
+
+export const cardTypeLabels: Record<CardType, string> = {
+  hero: '英雄',
+  construct: '神器',
+  monster: '怪物',
+}
+
+export const alwaysAvailableIds = ['mystic', 'heavy-infantry']
+export const alwaysAvailableMonsterId = 'cultist'
+
+export function getCard(cardId: string): CardDefinition {
+  return cardsById[cardId]
+}
+
+export function createInstance(cardId: string, seed: number): CardInstance {
+  return {
+    instanceId: `${cardId}-${seed}`,
+    cardId,
+  }
+}
+
+export function buildCenterDeck(seedStart: number): {
+  deck: CardInstance[]
+  nextSeed: number
+} {
+  const deck: CardInstance[] = []
+  let seed = seedStart
+
+  for (const card of cardDefinitions) {
+    if (card.copies === 0) {
+      continue
+    }
+
+    for (let index = 0; index < card.copies; index += 1) {
+      seed += 1
+      deck.push(createInstance(card.id, seed))
+    }
+  }
+
+  return {
+    deck,
+    nextSeed: seed,
+  }
+}
+
+export function describeEffects(effects: Effect[] | undefined): string {
+  if (!effects?.length) {
+    return ''
+  }
+
+  return effects
+    .map((effect) => {
+      switch (effect.type) {
+        case 'runes':
+          return `+${effect.amount} 符文`
+        case 'power':
+          return `+${effect.amount} 力量`
+        case 'draw':
+          return `抽 ${effect.amount} 张`
+        case 'honor':
+          return `+${effect.amount} 荣誉`
+      }
+    })
+    .join('，')
+}
