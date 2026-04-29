@@ -25,7 +25,7 @@ export const cardDefinitions: CardDefinition[] = [
   },
   {
     id: 'mystic',
-    name: '秘法师',
+    name: '秘教士',
     type: 'hero',
     faction: 'neutral',
     cost: 3,
@@ -70,8 +70,15 @@ export const cardDefinitions: CardDefinition[] = [
     effects: [],
     defeatEffects: [
       { type: 'honor', amount: 4 },
-      { type: 'acquire_any_center_card', optional: true },
-      { type: 'defeat_any_monster', optional: true },
+      {
+        type: 'choose',
+        label: '选择堕落之神的化身的奖励',
+        options: [
+          { id: 'skip', label: '不选择', effects: [] },
+          { id: 'acquire', label: '免费获得任意卡牌', effects: [{ type: 'acquire_any_center_card', optional: false }] },
+          { id: 'defeat', label: '免费击败任意怪物', effects: [{ type: 'defeat_any_monster', optional: false }] },
+        ],
+      },
     ],
   },
   {
@@ -131,8 +138,7 @@ export const cardDefinitions: CardDefinition[] = [
     effects: [],
     defeatEffects: [
       { type: 'honor', amount: 4 },
-      { type: 'banish_center_row', amount: 1, optional: true },
-      { type: 'banish_hand_discard', amount: 1, optional: true },
+      { type: 'banish_center_row_and_hand_discard', optional: true },
     ],
   },
   {
@@ -372,7 +378,7 @@ export const cardDefinitions: CardDefinition[] = [
     faction: 'lifebound',
     cost: 5,
     honor: 2,
-    copies: 1,
+    copies: 2,
     description: '获得 2 点荣誉，抽一张牌。',
     effects: [
       { type: 'honor', amount: 2 },
@@ -384,7 +390,7 @@ export const cardDefinitions: CardDefinition[] = [
     name: '低语贤者',
     type: 'hero',
     faction: 'lifebound',
-    cost: 5,
+    cost: 6,
     honor: 4,
     copies: 1,
     description: '+3 符文。',
@@ -421,7 +427,7 @@ export const cardDefinitions: CardDefinition[] = [
     name: '狼萨满',
     type: 'hero',
     faction: 'lifebound',
-    cost: 1,
+    cost: 3,
     honor: 1,
     copies: 3,
     description: '+1 符文，抽 1 张牌。',
@@ -690,7 +696,7 @@ export const cardDefinitions: CardDefinition[] = [
     cost: 5,
     honor: 3,
     copies: 2,
-    description: '每回合一次，+1 力量。每回合首次击败怪物时，+1 荣誉。',
+    description: '每回合一次，+1 力量。每回合首次击败中央牌列的怪物时，+1 荣誉。',
     effects: [
       { type: 'power', amount: 1, oncePerTurn: true },
       { type: 'honor_on_first_monster_defeat', amount: 1, oncePerTurn: true },

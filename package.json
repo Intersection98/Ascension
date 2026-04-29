@@ -7,7 +7,16 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "simulate:ai": "tsx experiments/scripts/simulate_ai.ts",
+    "simulate:ai:triple-standard": "tsx experiments/scripts/simulate_ai.ts -- triple-standard",
+    "train:rl": "tsx experiments/scripts/train_rl_strategy.ts",
+    "train:rl:triple-standard": "tsx experiments/scripts/train_rl_strategy.ts -- triple-standard",
+    "train:evo": "tsx experiments/scripts/train_rl_evolution.ts",
+    "train:evo:triple-standard": "tsx experiments/scripts/train_rl_evolution.ts -- triple-standard",
+    "train:versatile": "tsx experiments/scripts/train_rl_versatile.ts",
+    "simulate:ai:versatile": "tsx experiments/scripts/simulate_ai.ts -- versatile",
+    "simulate:ai:versatile-standard": "tsx experiments/scripts/simulate_ai.ts -- versatile-standard"
   },
   "dependencies": {
     "react": "^19.2.5",
@@ -23,6 +32,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.5.0",
+    "tsx": "^4.20.5",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.58.2",
     "vite": "^8.0.9"

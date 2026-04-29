@@ -1,5 +1,14 @@
 export type Faction = 'enlightened' | 'lifebound' | 'mechana' | 'void' | 'neutral'
 
+export type AiStrategy =
+  | 'standard'
+  | 'speedrun'
+  | 'avoid-mystic-first-8'
+  | 'avoid-heavy-infantry-first-8'
+  | 'rl-assassinate-god'
+  | 'rl-standard'
+  | 'rl-versatile'
+
 export type CardType = 'hero' | 'construct' | 'monster'
 export type CardDestination = 'discard' | 'top_deck' | 'hand'
 
@@ -10,6 +19,7 @@ export type Effect =
   | { type: 'honor'; amount: number; oncePerTurn?: boolean }
   | { type: 'banish_hand_discard'; amount: number; optional?: boolean }
   | { type: 'banish_center_row'; amount: number; optional?: boolean }
+  | { type: 'banish_center_row_and_hand_discard'; optional?: boolean }
   | { type: 'banish_hand'; amount: number }
   | { type: 'discard_then_draw'; discard: number; draw: number }
   | {
@@ -69,6 +79,13 @@ export type PendingChoice =
       source: string
     }
   | {
+      type: 'banish_center_row_and_hand_discard'
+      stage: 'center_row' | 'hand_discard'
+      optional: boolean
+      source: string
+      remainingHandDiscard: boolean
+    }
+  | {
       type: 'discard_then_draw'
       discard: number
       draw: number
@@ -124,17 +141,20 @@ export interface CardInstance {
 
 export interface TurnState {
   runes: number
+  mechanaRunes?: number
   power: number
   factionCounts: Partial<Record<Faction, number>>
   artifactDiscount?: number
   firstMonsterDefeatTriggered?: boolean
   cardsDrawnThisTurn?: number
+  activatedConstructIds?: string[]
 }
 
 export interface PlayerState {
   id: string
   name: string
   isAi: boolean
+  aiStrategy?: AiStrategy
   deck: CardInstance[]
   hand: CardInstance[]
   discard: CardInstance[]
@@ -151,6 +171,10 @@ export interface GameState {
   currentPlayerIndex: number
   centerDeck: CardInstance[]
   centerRow: CardInstance[]
+  reserveSupply: {
+    mystic: number
+    'heavy-infantry': number
+  }
   honorPool: number
   turn: TurnState
   log: string[]
@@ -164,4 +188,5 @@ export interface GameState {
 export interface PlayerConfig {
   name: string
   isAi: boolean
+  aiStrategy?: AiStrategy
 }

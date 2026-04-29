@@ -5,12 +5,16 @@ import {
   createInstance,
   getCard,
 } from './cards'
+import { rlAssassinateGodWeights } from './rl-weights'
+import { rlStandardWeights } from './rl-weights-standard'
+import { rlVersatileWeights } from './rl-weights-versatile'
 import type {
   CardDefinition,
   CardDestination,
   CardInstance,
   CardType,
   Effect,
+  AiStrategy,
   Faction,
   GameState,
   PendingChoice,
@@ -20,6 +24,49 @@ import type {
 
 const CENTER_ROW_SIZE = 6
 const STARTING_HAND_SIZE = 5
+const FALLEN_GOD_ID = 'incarnation-of-the-fallen-god'
+const RL_LOOKAHEAD_DISCOUNT = 0.65
+const RL_LOOKAHEAD_MAX_TRANSITIONS = 40
+
+export type AiDecision =
+  | { kind: 'play_card'; instanceId: string }
+  | { kind: 'activate_construct'; instanceId: string }
+  | { kind: 'acquire_center'; instanceId: string }
+  | { kind: 'acquire_reserve'; cardId: string }
+  | { kind: 'defeat_center_monster'; instanceId: string }
+  | { kind: 'defeat_cultist' }
+  | { kind: 'resolve_pending_card'; instanceId: string }
+  | { kind: 'resolve_pending_option'; optionId: string }
+  | { kind: 'skip_pending' }
+  | { kind: 'end_turn' }
+
+export type RlWeights = typeof rlAssassinateGodWeights
+
+export interface RlDecisionEvaluation {
+  decision: AiDecision
+  nextState: GameState
+  immediateValue: number
+  continuationValue: number
+  qValue: number
+  features: RlWeights
+}
+
+const rlFeatureKeys = Object.keys(rlAssassinateGodWeights) as Array<keyof RlWeights>
+
+function getRlWeightsForStrategy(strategy: AiStrategy): RlWeights {
+  switch (strategy) {
+    case 'rl-standard':
+      return rlStandardWeights
+    case 'rl-versatile':
+      return rlVersatileWeights
+    default:
+      return rlAssassinateGodWeights
+  }
+}
+
+function isRlStrategy(strategy: AiStrategy): boolean {
+  return strategy === 'rl-assassinate-god' || strategy === 'rl-standard' || strategy === 'rl-versatile'
+}
 
 function shuffle<T>(items: T[]): T[] {
   const next = [...items]
@@ -55,8 +102,12 @@ function clonePendingChoice(choice: PendingChoice | undefined): PendingChoice | 
 
   switch (choice.type) {
     case 'banish_hand_discard':
+    case 'banish_hand':
     case 'banish_center_row':
+    case 'banish_center_row_and_hand_discard':
     case 'discard_then_draw':
+    case 'defeat_monster_upto_cost':
+    case 'defeat_any_monster':
     case 'acquire_from_center':
       return { ...choice }
     case 'choose':
@@ -76,10 +127,16 @@ function cloneState(state: GameState): GameState {
     players: state.players.map(clonePlayer),
     centerDeck: cloneCards(state.centerDeck),
     centerRow: cloneCards(state.centerRow),
+    reserveSupply: { ...state.reserveSupply },
     turn: {
       runes: state.turn.runes,
+      mechanaRunes: state.turn.mechanaRunes,
       power: state.turn.power,
       factionCounts: { ...state.turn.factionCounts },
+      artifactDiscount: state.turn.artifactDiscount,
+      firstMonsterDefeatTriggered: state.turn.firstMonsterDefeatTriggered,
+      cardsDrawnThisTurn: state.turn.cardsDrawnThisTurn,
+      activatedConstructIds: [...(state.turn.activatedConstructIds ?? [])],
     },
     log: [...state.log],
     winnerIds: [...state.winnerIds],
@@ -210,10 +267,30 @@ function applyEffects(
         })
         addLog(state, `${player.name} 可以通过 ${source} 放逐中心牌列中的牌`)
         break
+      case 'banish_center_row_and_hand_discard': {
+        const hasCenterRow = state.centerRow.length > 0
+        const hasHandOrDiscard = player.hand.length + player.discard.length > 0
+        if (!hasCenterRow && !hasHandOrDiscard) {
+          break
+        }
+        setPendingChoice(state, {
+          type: 'banish_center_row_and_hand_discard',
+          stage: hasCenterRow ? 'center_row' : 'hand_discard',
+          optional: effect.optional ?? true,
+          source,
+          remainingHandDiscard: hasHandOrDiscard,
+        })
+        addLog(state, `${player.name} 可以通过 ${source} 放逐中心牌列中的牌和/或手牌、弃牌堆中的牌`)
+        break
+      }
       case 'discard_then_draw':
-        if (player.hand.length === 0) {
+        // Some cards require discarding first; if the cost can't be paid, the effect does not trigger.
+        if (effect.discard <= 0) {
           drawCards(player, effect.draw)
           addLog(state, `${player.name} 通过 ${source} 抽了 ${effect.draw} 张牌`)
+          break
+        }
+        if (player.hand.length < effect.discard) {
           break
         }
         setPendingChoice(state, {
@@ -228,7 +305,7 @@ function applyEffects(
         const canDefeatAny = state.centerRow.some((card) => {
           const definition = getCard(card.cardId)
           return definition.type === 'monster' && definition.cost <= effect.cost
-        })
+        }) || canDefeatCultistForEffect(effect.cost)
         if (!canDefeatAny) {
           break
         }
@@ -238,20 +315,25 @@ function applyEffects(
           optional: false,
           source,
         })
-        addLog(state, `${player.name} 可以通过 ${source} 免费击败一个费用 ${effect.cost} 或以下的怪物`)
+        addLog(state, `${player.name} 可以通过 ${source} 免费击败一个费用 ${effect.cost} 或以下的怪物（含邪教徒）`)
         break
       }
       case 'acquire_from_center':
         if (
           !state.centerRow.some((card) =>
-            matchesAcquireFilter(getCard(card.cardId), effect.maxCost, effect.cardTypes),
-          )
+            matchesAcquireFilter(getCard(card.cardId), effect.maxCost ?? Number.POSITIVE_INFINITY, effect.cardTypes),
+          ) &&
+          getAvailableAcquireReserveIds(
+            state,
+            effect.maxCost ?? Number.POSITIVE_INFINITY,
+            effect.cardTypes,
+          ).length === 0
         ) {
           break
         }
         setPendingChoice(state, {
           type: 'acquire_from_center',
-          maxCost: effect.maxCost,
+          maxCost: effect.maxCost ?? Number.POSITIVE_INFINITY,
           cardTypes: effect.cardTypes,
           destination: effect.destination ?? 'discard',
           optional: effect.optional ?? true,
@@ -261,7 +343,10 @@ function applyEffects(
         break
       case 'acquire_any_center_card': {
         const maxCost = 999
-        if (!state.centerRow.some((card) => matchesAcquireFilter(getCard(card.cardId), maxCost, undefined))) {
+        if (
+          !state.centerRow.some((card) => matchesAcquireFilter(getCard(card.cardId), maxCost, undefined)) &&
+          getAvailableAcquireReserveIds(state, maxCost, undefined).length === 0
+        ) {
           break
         }
         setPendingChoice(state, {
@@ -276,7 +361,8 @@ function applyEffects(
         break
       }
       case 'defeat_any_monster': {
-        const anyMonster = state.centerRow.some((card) => getCard(card.cardId).type === 'monster')
+        const anyMonster =
+          state.centerRow.some((card) => getCard(card.cardId).type === 'monster') || canDefeatCultistForEffect()
         if (!anyMonster) {
           break
         }
@@ -285,7 +371,7 @@ function applyEffects(
           optional: effect.optional ?? true,
           source,
         })
-        addLog(state, `${player.name} 可以通过 ${source} 免费击败中心牌列中的任意怪物`)
+        addLog(state, `${player.name} 可以通过 ${source} 免费击败任意怪物`)
         break
       }
       case 'steal_card_from_each_opponent': {
@@ -345,11 +431,9 @@ function applyEffects(
         break
       }
       case 'honor_per_artifact_faction': {
-        const factions = hasAllArtifactsMechana(player)
-          ? player.constructs.length > 0
-            ? new Set<Faction>(['mechana'])
-            : new Set<Faction>()
-          : new Set<Faction>(player.constructs.map((card) => getCard(card.cardId).faction))
+        // Count each construct's printed faction. "All artifacts are Mechana" enables
+        // Mechana synergies, but does not erase the construct's original faction here.
+        const factions = new Set<Faction>(player.constructs.map((card) => getCard(card.cardId).faction))
         const count = factions.size
         if (count > 0) {
           awardHonor(state, player, effect.amount * count, source)
@@ -357,14 +441,11 @@ function applyEffects(
         break
       }
       case 'runes_for_mechana_artifacts':
-        // Simplified: treat as normal runes (we don't model restricted currency yet).
-        state.turn.runes += effect.amount
-        addLog(state, `${player.name} 从 ${source} 获得 ${effect.amount} 点符文（机械神器限定符文，当前按普通符文处理）`)
+        state.turn.mechanaRunes = (state.turn.mechanaRunes ?? 0) + effect.amount
+        addLog(state, `${player.name} 从 ${source} 获得 ${effect.amount} 点机械限定符文`)
         break
       case 'power_per_mechana_artifact': {
-        const count = hasAllArtifactsMechana(player)
-          ? player.constructs.length
-          : player.constructs.filter((card) => getCard(card.cardId).faction === 'mechana').length
+        const count = player.constructs.filter((card) => isMechanaArtifact(player, getCard(card.cardId))).length
         if (count <= 0) {
           break
         }
@@ -460,7 +541,15 @@ function removeCard(cards: CardInstance[], instanceId: string): CardInstance | u
 }
 
 function refillCenterRow(state: GameState) {
-  while (state.centerRow.length < CENTER_ROW_SIZE && state.centerDeck.length > 0) {
+  while (state.centerRow.length < CENTER_ROW_SIZE) {
+    if (state.centerDeck.length === 0) {
+      recycleVoidedIntoCenterDeckIfNeeded(state)
+    }
+
+    if (state.centerDeck.length === 0) {
+      break
+    }
+
     const next = state.centerDeck.shift()
     if (next) {
       state.centerRow.push(next)
@@ -468,8 +557,46 @@ function refillCenterRow(state: GameState) {
   }
 }
 
+function recycleVoidedIntoCenterDeckIfNeeded(state: GameState) {
+  // If the center deck needs to provide cards but is empty, recycle eligible voided cards
+  // back into the center deck so refills can continue immediately.
+  if (state.centerDeck.length > 0) {
+    return
+  }
+
+  const excludedFromCenterDeck = new Set(['apprentice', 'militia', 'mystic', 'heavy-infantry'])
+  const recycled: CardInstance[] = []
+  for (const player of state.players) {
+    if (player.voided.length === 0) {
+      continue
+    }
+
+    const remainingVoided: CardInstance[] = []
+    for (const card of player.voided) {
+      if (excludedFromCenterDeck.has(card.cardId)) {
+        remainingVoided.push(card)
+      } else {
+        recycled.push(card)
+      }
+    }
+
+    player.voided = remainingVoided
+  }
+
+  if (recycled.length === 0) {
+    return
+  }
+
+  state.centerDeck = shuffle(recycled)
+  addLog(state, `中央牌库补牌时已空，将放逐区 ${recycled.length} 张牌洗回中心牌库`)
+}
+
 function replaceCenterRowSlot(state: GameState, index: number) {
   // Keep other slots stable: replace the acquired/defeated card in-place when possible.
+  if (state.centerDeck.length === 0) {
+    recycleVoidedIntoCenterDeckIfNeeded(state)
+  }
+
   const next = state.centerDeck.shift()
   if (next) {
     state.centerRow[index] = next
@@ -528,8 +655,45 @@ function matchesAcquireFilter(
   return true
 }
 
+function hasReserveSupply(state: GameState, cardId: string): boolean {
+  if (cardId === 'mystic') {
+    return state.reserveSupply.mystic > 0
+  }
+
+  if (cardId === 'heavy-infantry') {
+    return state.reserveSupply['heavy-infantry'] > 0
+  }
+
+  return true
+}
+
+function getAvailableAcquireReserveIds(
+  state: GameState,
+  maxCost: number,
+  cardTypes: CardType[] | undefined,
+): string[] {
+  return alwaysAvailableIds.filter(
+    (cardId) => hasReserveSupply(state, cardId) && matchesAcquireFilter(getCard(cardId), maxCost, cardTypes),
+  )
+}
+
+function canDefeatCultistForEffect(maxCost?: number): boolean {
+  const cultist = getCard(alwaysAvailableMonsterId)
+  return cultist.type === 'monster' && (maxCost === undefined || cultist.cost <= maxCost)
+}
+
 function shouldTriggerFinalRound(state: GameState): boolean {
-  return state.honorPool <= 0 || (state.centerDeck.length === 0 && state.centerRow.length < CENTER_ROW_SIZE)
+  if (state.honorPool <= 0) {
+    return true
+  }
+
+  // With recycling enabled, the game should not end just because the center deck runs out.
+  // If the center is fully empty and nothing can be recycled, end the game to avoid deadlock.
+  const excludedFromCenterDeck = new Set(['apprentice', 'militia', 'mystic', 'heavy-infantry'])
+  const hasAnyRecyclableVoided = state.players.some((player) =>
+    player.voided.some((card) => !excludedFromCenterDeck.has(card.cardId)),
+  )
+  return !hasAnyRecyclableVoided && state.centerDeck.length === 0 && state.centerRow.length === 0
 }
 
 function calculateScore(player: PlayerState): number {
@@ -547,20 +711,28 @@ function calculateScore(player: PlayerState): number {
 function finalizeIfNeeded(state: GameState, nextPlayerIndex: number) {
   if (state.finalRoundTriggeredBy === undefined && shouldTriggerFinalRound(state)) {
     state.finalRoundTriggeredBy = state.currentPlayerIndex
-    addLog(state, '终局回合已触发，每位其他玩家还会再进行 1 回合')
+    addLog(state, '终局回合已触发，将补足本轮剩余玩家回合后结束游戏')
   }
 
   if (
     state.finalRoundTriggeredBy !== undefined &&
-    nextPlayerIndex === state.finalRoundTriggeredBy
+    // The game starts at seat 1 (index 0). Once the honor pool is empty, finish the current round
+    // so all players have taken the same number of turns. That means: end when the next player
+    // would wrap back to seat 1.
+    nextPlayerIndex === 0
   ) {
-    const ranked = [...state.players]
-      .map((player) => ({ player, score: calculateScore(player) }))
-      .sort((left, right) => right.score - left.score)
-    const topScore = ranked[0]?.score ?? 0
-    state.winnerIds = ranked
-      .filter((entry) => entry.score === topScore)
-      .map((entry) => entry.player.id)
+    const scores = state.players.map((player) => ({ player, score: calculateScore(player) }))
+    const topScore = Math.max(...scores.map((entry) => entry.score), 0)
+
+    // Tie-breaker: if scores tie, the last seat (highest player index) wins.
+    let winnerIndex = -1
+    for (let index = 0; index < state.players.length; index += 1) {
+      if (scores[index]?.score === topScore) {
+        winnerIndex = index
+      }
+    }
+
+    state.winnerIds = winnerIndex >= 0 ? [state.players[winnerIndex].id] : []
     state.gameOver = true
     addLog(state, '游戏结束，已统计最终分数')
   }
@@ -569,11 +741,13 @@ function finalizeIfNeeded(state: GameState, nextPlayerIndex: number) {
 function startTurn(state: GameState) {
   state.turn = {
     runes: 0,
+    mechanaRunes: 0,
     power: 0,
     factionCounts: {},
     artifactDiscount: 0,
     firstMonsterDefeatTriggered: false,
     cardsDrawnThisTurn: 0,
+    activatedConstructIds: [],
   }
 
   const player = currentPlayer(state)
@@ -587,6 +761,10 @@ function hasAllArtifactsMechana(player: PlayerState): boolean {
   )
 }
 
+function isStrictMechanaArtifact(definition: CardDefinition): boolean {
+  return definition.type === 'construct' && definition.faction === 'mechana'
+}
+
 function isMechanaArtifact(player: PlayerState, definition: CardDefinition): boolean {
   if (definition.type !== 'construct') {
     return false
@@ -594,11 +772,17 @@ function isMechanaArtifact(player: PlayerState, definition: CardDefinition): boo
   return definition.faction === 'mechana' || hasAllArtifactsMechana(player)
 }
 
-function triggerOnMechanaArtifactPlayed(state: GameState, player: PlayerState, played: CardDefinition) {
-  if (!isMechanaArtifact(player, played)) {
-    return
-  }
+function countMechanaArtifactsInPlay(player: PlayerState): number {
+  return player.constructs.filter((card) => isMechanaArtifact(player, getCard(card.cardId))).length
+}
 
+function countHedronCannonsInPlay(player: PlayerState): number {
+  return player.constructs.filter((card) =>
+    getCard(card.cardId).effects?.some((effect) => effect.type === 'power_per_mechana_artifact'),
+  ).length
+}
+
+function triggerOnMechanaArtifactPlayed(state: GameState, player: PlayerState) {
   const drawAmount = player.constructs.reduce((total, card) => {
     const definition = getCard(card.cardId)
     return (
@@ -616,8 +800,29 @@ function triggerOnMechanaArtifactPlayed(state: GameState, player: PlayerState, p
   }
 }
 
-function triggerFirstMonsterDefeatEffects(state: GameState, player: PlayerState) {
-  if (state.turn.firstMonsterDefeatTriggered) {
+function triggerHedronCannonPowerRefresh(
+  state: GameState,
+  player: PlayerState,
+  previousMechanaArtifactCount: number,
+  previousHedronCannonCount: number,
+) {
+  const currentMechanaArtifactCount = countMechanaArtifactsInPlay(player)
+  const addedMechanaArtifacts = currentMechanaArtifactCount - previousMechanaArtifactCount
+  if (addedMechanaArtifacts <= 0 || previousHedronCannonCount <= 0) {
+    return
+  }
+
+  const powerGain = addedMechanaArtifacts * previousHedronCannonCount
+  state.turn.power += powerGain
+  addLog(state, `${player.name} 的希德伦加农炮因新机械神器联动额外获得 ${powerGain} 点力量`)
+}
+
+function triggerFirstMonsterDefeatEffects(
+  state: GameState,
+  player: PlayerState,
+  triggeredByCenterRowMonster: boolean,
+) {
+  if (state.turn.firstMonsterDefeatTriggered || !triggeredByCenterRowMonster) {
     return
   }
 
@@ -665,6 +870,7 @@ export function createGame(playerConfigs: PlayerConfig[]): GameState {
       id: `player-${index + 1}`,
       name: config.name,
       isAi: config.isAi,
+      aiStrategy: config.isAi ? config.aiStrategy ?? 'standard' : undefined,
       deck: starter.deck,
       hand: [],
       discard: [],
@@ -687,6 +893,7 @@ export function createGame(playerConfigs: PlayerConfig[]): GameState {
     currentPlayerIndex: 0,
     centerDeck: shuffle(center.deck),
     centerRow: [],
+    reserveSupply: { mystic: 20, 'heavy-infantry': 20 },
     honorPool: Math.max(30, playerConfigs.length * 30),
     turn: {
       runes: 0,
@@ -736,6 +943,9 @@ export function playCard(state: GameState, instanceId: string): GameState {
   }
 
   const definition = getCard(card.cardId)
+  const previousMechanaArtifactCount =
+    definition.type === 'construct' ? countMechanaArtifactsInPlay(player) : 0
+  const previousHedronCannonCount = definition.type === 'construct' ? countHedronCannonsInPlay(player) : 0
   const alreadyPlayedSameFaction =
     definition.faction !== 'neutral' && (next.turn.factionCounts[definition.faction] ?? 0) > 0
 
@@ -751,7 +961,16 @@ export function playCard(state: GameState, instanceId: string): GameState {
   addLog(next, `${player.name} 打出了 ${definition.name}`)
   applyEffects(next, player, definition.effects, definition.name)
   if (definition.type === 'construct') {
-    triggerOnMechanaArtifactPlayed(next, player, definition)
+    const isPlayedMechanaArtifact = isMechanaArtifact(player, definition)
+    if (isPlayedMechanaArtifact) {
+      triggerOnMechanaArtifactPlayed(next, player)
+    }
+    triggerHedronCannonPowerRefresh(
+      next,
+      player,
+      previousMechanaArtifactCount,
+      previousHedronCannonCount,
+    )
   }
 
   if (alreadyPlayedSameFaction && definition.factionBonus) {
@@ -780,6 +999,46 @@ function canAfford(turnValue: number, cost: number) {
   return turnValue >= cost
 }
 
+function getConstructDiscount(turn: GameState['turn'], definition: CardDefinition) {
+  return definition.type === 'construct' ? Math.min(turn.artifactDiscount ?? 0, definition.cost) : 0
+}
+
+function getPurchasableRunes(turn: GameState['turn'], definition: CardDefinition) {
+  const mechanaRunes = isStrictMechanaArtifact(definition) ? (turn.mechanaRunes ?? 0) : 0
+  return turn.runes + mechanaRunes
+}
+
+export function canAcquireCard(state: GameState, definition: CardDefinition): boolean {
+  const effectiveCost = definition.cost - getConstructDiscount(state.turn, definition)
+  if (definition.type === 'monster') {
+    return false
+  }
+
+  return canAfford(getPurchasableRunes(state.turn, definition), effectiveCost)
+}
+
+function spendRunesForAcquire(turn: GameState['turn'], definition: CardDefinition): boolean {
+  const discount = getConstructDiscount(turn, definition)
+  let remainingCost = definition.cost - discount
+
+  if (!canAfford(getPurchasableRunes(turn, definition), remainingCost)) {
+    return false
+  }
+
+  if (discount > 0) {
+    turn.artifactDiscount = Math.max(0, (turn.artifactDiscount ?? 0) - discount)
+  }
+
+  if (isStrictMechanaArtifact(definition)) {
+    const spentRestricted = Math.min(turn.mechanaRunes ?? 0, remainingCost)
+    turn.mechanaRunes = Math.max(0, (turn.mechanaRunes ?? 0) - spentRestricted)
+    remainingCost -= spentRestricted
+  }
+
+  turn.runes -= remainingCost
+  return true
+}
+
 export function acquireCenterCard(state: GameState, instanceId: string): GameState {
   const next = cloneState(state)
   if (next.gameOver || hasPendingChoice(next)) {
@@ -794,17 +1053,10 @@ export function acquireCenterCard(state: GameState, instanceId: string): GameSta
   const card = next.centerRow[index]
 
   const definition = getCard(card.cardId)
-  const discount =
-    definition.type === 'construct' ? Math.min(next.turn.artifactDiscount ?? 0, definition.cost) : 0
-  const effectiveCost = definition.cost - discount
-  if (definition.type === 'monster' || !canAfford(next.turn.runes, effectiveCost)) {
+  if (definition.type === 'monster' || !spendRunesForAcquire(next.turn, definition)) {
     return next
   }
 
-  next.turn.runes -= effectiveCost
-  if (discount > 0) {
-    next.turn.artifactDiscount = Math.max(0, (next.turn.artifactDiscount ?? 0) - discount)
-  }
   const hasMechanaToHand = player.constructs.some((owned) =>
     getCard(owned.cardId).effects?.some((effect) => effect.type === 'mechana_artifact_to_hand'),
   )
@@ -825,14 +1077,25 @@ export function acquireAlwaysAvailable(state: GameState, cardId: string): GameSt
     return next
   }
 
-  const player = currentPlayer(next)
-  const definition = getCard(cardId)
-  if (!canAfford(next.turn.runes, definition.cost)) {
+  if (cardId === 'mystic' && next.reserveSupply.mystic <= 0) {
+    return next
+  }
+  if (cardId === 'heavy-infantry' && next.reserveSupply['heavy-infantry'] <= 0) {
     return next
   }
 
-  next.turn.runes -= definition.cost
+  const player = currentPlayer(next)
+  const definition = getCard(cardId)
+  if (!spendRunesForAcquire(next.turn, definition)) {
+    return next
+  }
+
   next.seed += 1
+  if (cardId === 'mystic') {
+    next.reserveSupply.mystic -= 1
+  } else if (cardId === 'heavy-infantry') {
+    next.reserveSupply['heavy-infantry'] -= 1
+  }
   player.discard.push(createInstance(cardId, next.seed))
   addLog(next, `${player.name} 购买了常驻卡 ${definition.name}`)
   return next
@@ -860,7 +1123,7 @@ export function defeatCenterMonster(state: GameState, instanceId: string): GameS
   player.voided.push(card)
   addLog(next, `${player.name} 击败了 ${definition.name}`)
   applyEffects(next, player, definition.defeatEffects, `${definition.name} 的击败奖励`)
-  triggerFirstMonsterDefeatEffects(next, player)
+  triggerFirstMonsterDefeatEffects(next, player, true)
   replaceCenterRowSlot(next, index)
   return next
 }
@@ -882,13 +1145,17 @@ export function defeatCultist(state: GameState): GameState {
   player.voided.push(createInstance(alwaysAvailableMonsterId, next.seed))
   addLog(next, `${player.name} 击败了常驻怪物 ${definition.name}`)
   applyEffects(next, player, definition.defeatEffects, definition.name)
-  triggerFirstMonsterDefeatEffects(next, player)
+  triggerFirstMonsterDefeatEffects(next, player, false)
   return next
 }
 
 export function activateConstruct(state: GameState, instanceId: string): GameState {
   const next = cloneState(state)
   if (next.gameOver || hasPendingChoice(next)) {
+    return next
+  }
+
+  if ((next.turn.activatedConstructIds ?? []).includes(instanceId)) {
     return next
   }
 
@@ -903,6 +1170,8 @@ export function activateConstruct(state: GameState, instanceId: string): GameSta
     player.constructs.push(construct)
     return next
   }
+
+  next.turn.activatedConstructIds = [...(next.turn.activatedConstructIds ?? []), instanceId]
 
   if (definition.banishOnActivate) {
     player.voided.push(construct)
@@ -966,6 +1235,7 @@ export function resolvePendingChoiceWithCard(state: GameState, instanceId: strin
         return next
       }
 
+      player.voided.push(card)
       clearPendingChoice(next)
       addLog(next, `${player.name} 通过 ${pending.source} 放逐了 ${getCard(card.cardId).name}`)
       return next
@@ -988,9 +1258,44 @@ export function resolvePendingChoiceWithCard(state: GameState, instanceId: strin
       }
       const card = next.centerRow[index]
 
+      player.voided.push(card)
       clearPendingChoice(next)
       addLog(next, `${player.name} 通过 ${pending.source} 放逐了中心牌列中的 ${getCard(card.cardId).name}`)
       replaceCenterRowSlot(next, index)
+      return next
+    }
+    case 'banish_center_row_and_hand_discard': {
+      if (pending.stage === 'center_row') {
+        const index = next.centerRow.findIndex((candidate) => candidate.instanceId === instanceId)
+        if (index === -1) {
+          return next
+        }
+        const card = next.centerRow[index]
+
+        player.voided.push(card)
+        addLog(next, `${player.name} 通过 ${pending.source} 放逐了中心牌列中的 ${getCard(card.cardId).name}`)
+        replaceCenterRowSlot(next, index)
+
+        if (pending.remainingHandDiscard && player.hand.length + player.discard.length > 0) {
+          setPendingChoice(next, {
+            ...pending,
+            stage: 'hand_discard',
+            remainingHandDiscard: false,
+          })
+        } else {
+          clearPendingChoice(next)
+        }
+        return next
+      }
+
+      const card = removeCardFromHandOrDiscard(player, instanceId)
+      if (!card) {
+        return next
+      }
+
+      player.voided.push(card)
+      clearPendingChoice(next)
+      addLog(next, `${player.name} 通过 ${pending.source} 放逐了 ${getCard(card.cardId).name}`)
       return next
     }
     case 'discard_then_draw': {
@@ -1007,6 +1312,21 @@ export function resolvePendingChoiceWithCard(state: GameState, instanceId: strin
       return next
     }
     case 'defeat_monster_upto_cost': {
+      if (instanceId === alwaysAvailableMonsterId) {
+        const definition = getCard(alwaysAvailableMonsterId)
+        if (definition.cost > pending.maxCost) {
+          return next
+        }
+
+        next.seed += 1
+        player.voided.push(createInstance(alwaysAvailableMonsterId, next.seed))
+        clearPendingChoice(next)
+        addLog(next, `${player.name} 通过 ${pending.source} 免费击败了常驻怪物 ${definition.name}`)
+        applyEffects(next, player, definition.defeatEffects, `${definition.name} 的击败奖励`)
+        triggerFirstMonsterDefeatEffects(next, player, false)
+        return next
+      }
+
       const index = next.centerRow.findIndex((candidate) => candidate.instanceId === instanceId)
       if (index === -1) {
         return next
@@ -1021,11 +1341,22 @@ export function resolvePendingChoiceWithCard(state: GameState, instanceId: strin
       clearPendingChoice(next)
       addLog(next, `${player.name} 通过 ${pending.source} 免费击败了 ${definition.name}`)
       applyEffects(next, player, definition.defeatEffects, `${definition.name} 的击败奖励`)
-      triggerFirstMonsterDefeatEffects(next, player)
+      triggerFirstMonsterDefeatEffects(next, player, true)
       replaceCenterRowSlot(next, index)
       return next
     }
     case 'defeat_any_monster': {
+      if (instanceId === alwaysAvailableMonsterId) {
+        const definition = getCard(alwaysAvailableMonsterId)
+        next.seed += 1
+        player.voided.push(createInstance(alwaysAvailableMonsterId, next.seed))
+        clearPendingChoice(next)
+        addLog(next, `${player.name} 通过 ${pending.source} 免费击败了常驻怪物 ${definition.name}`)
+        applyEffects(next, player, definition.defeatEffects, `${definition.name} 的击败奖励`)
+        triggerFirstMonsterDefeatEffects(next, player, false)
+        return next
+      }
+
       const index = next.centerRow.findIndex((candidate) => candidate.instanceId === instanceId)
       if (index === -1) {
         return next
@@ -1040,11 +1371,30 @@ export function resolvePendingChoiceWithCard(state: GameState, instanceId: strin
       clearPendingChoice(next)
       addLog(next, `${player.name} 通过 ${pending.source} 免费击败了 ${definition.name}`)
       applyEffects(next, player, definition.defeatEffects, `${definition.name} 的击败奖励`)
-      triggerFirstMonsterDefeatEffects(next, player)
+      triggerFirstMonsterDefeatEffects(next, player, true)
       replaceCenterRowSlot(next, index)
       return next
     }
     case 'acquire_from_center': {
+      if (alwaysAvailableIds.includes(instanceId)) {
+        const definition = getCard(instanceId)
+        if (!hasReserveSupply(next, instanceId) || !matchesAcquireFilter(definition, pending.maxCost, pending.cardTypes)) {
+          return next
+        }
+
+        next.seed += 1
+        if (instanceId === 'mystic') {
+          next.reserveSupply.mystic -= 1
+        } else if (instanceId === 'heavy-infantry') {
+          next.reserveSupply['heavy-infantry'] -= 1
+        }
+
+        clearPendingChoice(next)
+        moveCardToDestination(player, createInstance(instanceId, next.seed), pending.destination)
+        addLog(next, `${player.name} 通过 ${pending.source} 免费获得了常驻牌 ${definition.name}`)
+        return next
+      }
+
       const index = next.centerRow.findIndex((candidate) => candidate.instanceId === instanceId)
       if (index === -1) {
         return next
@@ -1095,17 +1445,20 @@ export function skipPendingChoice(state: GameState): GameState {
   const player = currentPlayer(next)
   const pending = next.pendingChoice
 
-  if (
-    pending.type === 'choose' ||
-    pending.type === 'discard_then_draw' ||
-    (!pending.optional &&
-      (pending.type === 'acquire_from_center' ||
-        pending.type === 'defeat_any_monster' ||
-        pending.type === 'defeat_monster_upto_cost' ||
-        pending.type === 'banish_hand' ||
-        pending.type === 'banish_hand_discard' ||
-        pending.type === 'banish_center_row'))
-  ) {
+  if (pending.type === 'banish_center_row_and_hand_discard') {
+    if (pending.stage === 'center_row') {
+      if (pending.remainingHandDiscard && player.hand.length + player.discard.length > 0) {
+        setPendingChoice(next, {
+          ...pending,
+          stage: 'hand_discard',
+          remainingHandDiscard: false,
+        })
+        addLog(next, `${player.name} 跳过了 ${pending.source} 的中心牌列放逐效果`)
+        return next
+      }
+    }
+    clearPendingChoice(next)
+    addLog(next, `${player.name} 跳过了 ${pending.source} 的额外效果`)
     return next
   }
 
@@ -1134,6 +1487,8 @@ function estimateEffects(effects: Effect[] | undefined): number {
         return total + optionalFactor * 2.4 * effect.amount
       case 'banish_center_row':
         return total + optionalFactor * 1.2 * effect.amount
+      case 'banish_center_row_and_hand_discard':
+        return total + optionalFactor * 3.2
       case 'banish_hand':
         return total + 2.2 * effect.amount
       case 'discard_then_draw':
@@ -1201,6 +1556,55 @@ function estimateEffects(effects: Effect[] | undefined): number {
   }, 0)
 }
 
+function getAiWeights(strategy: AiStrategy) {
+  if (strategy === 'speedrun') {
+    return {
+      cost: 0.3,
+      honor: 0.8,
+      runes: 1.0,
+      power: 2.0,
+      draw: 1.2,
+      constructBonus: 1.5,
+      monsterBonus: 0.8,
+    }
+  }
+
+  return {
+    cost: 1.5,
+    honor: 1.8,
+    runes: 1.3,
+    power: 1.3,
+    draw: 2.0,
+    constructBonus: 3,
+    monsterBonus: 1,
+  }
+}
+
+function estimateEffectsForAi(strategy: AiStrategy, effects: Effect[] | undefined): number {
+  if (!effects?.length) {
+    return 0
+  }
+
+  const weights = getAiWeights(strategy)
+
+  return effects.reduce((total, effect) => {
+    const optionalFactor = 'optional' in effect && effect.optional ? 0.7 : 1
+    switch (effect.type) {
+      case 'runes':
+        return total + optionalFactor * effect.amount * weights.runes
+      case 'power':
+        return total + optionalFactor * effect.amount * weights.power
+      case 'draw':
+        return total + optionalFactor * effect.amount * weights.draw
+      case 'honor':
+        return total + optionalFactor * effect.amount * weights.honor
+      default:
+        // Fall back to the standard heuristic for non-core effects.
+        return total + optionalFactor * estimateEffects([effect])
+    }
+  }, 0)
+}
+
 function rateCard(definition: CardDefinition): number {
   const base =
     definition.cost * 1.5 +
@@ -1220,9 +1624,30 @@ function rateCard(definition: CardDefinition): number {
   return base
 }
 
-function pickWorstCenterRowCard(state: GameState): CardInstance | undefined {
+function rateCardForAi(strategy: AiStrategy, definition: CardDefinition): number {
+  const weights = getAiWeights(strategy)
+  const base =
+    definition.cost * weights.cost +
+    definition.honor * weights.honor +
+    estimateEffectsForAi(strategy, definition.effects) +
+    estimateEffectsForAi(strategy, definition.factionBonus) +
+    estimateEffectsForAi(strategy, definition.defeatEffects)
+
+  if (definition.type === 'construct') {
+    return base + weights.constructBonus
+  }
+
+  if (definition.type === 'monster') {
+    return base + weights.monsterBonus
+  }
+
+  return base
+}
+
+function pickWorstCenterRowCard(state: GameState, strategy: AiStrategy): CardInstance | undefined {
   return [...state.centerRow].sort(
-    (left, right) => rateCard(getCard(left.cardId)) - rateCard(getCard(right.cardId)),
+    (left, right) =>
+      rateCardForAi(strategy, getCard(left.cardId)) - rateCardForAi(strategy, getCard(right.cardId)),
   )[0]
 }
 
@@ -1230,41 +1655,50 @@ function pickBestCenterRowCardForAcquire(
   state: GameState,
   maxCost: number,
   cardTypes: CardType[] | undefined,
+  strategy: AiStrategy,
 ): CardInstance | undefined {
   return [...state.centerRow]
     .filter((card) => matchesAcquireFilter(getCard(card.cardId), maxCost, cardTypes))
-    .sort((left, right) => rateCard(getCard(right.cardId)) - rateCard(getCard(left.cardId)))[0]
+    .sort(
+      (left, right) =>
+        rateCardForAi(strategy, getCard(right.cardId)) - rateCardForAi(strategy, getCard(left.cardId)),
+    )[0]
 }
 
-function pickWeakestPlayerCard(player: PlayerState): CardInstance | undefined {
+function pickWeakestPlayerCard(player: PlayerState, strategy: AiStrategy): CardInstance | undefined {
   const candidates = [...player.hand, ...player.discard]
   return candidates.sort(
-    (left, right) => rateCard(getCard(left.cardId)) - rateCard(getCard(right.cardId)),
+    (left, right) =>
+      rateCardForAi(strategy, getCard(left.cardId)) - rateCardForAi(strategy, getCard(right.cardId)),
   )[0]
 }
 
-function chooseBestOptionId(state: GameState, pending: Extract<PendingChoice, { type: 'choose' }>) {
+function chooseBestOptionId(
+  state: GameState,
+  pending: Extract<PendingChoice, { type: 'choose' }>,
+  strategy: AiStrategy,
+) {
   let bestId = pending.options[0]?.id
   let bestScore = Number.NEGATIVE_INFINITY
 
   for (const option of pending.options) {
-    let score = estimateEffects(option.effects)
+    let score = estimateEffectsForAi(strategy, option.effects)
 
     for (const effect of option.effects) {
       if (effect.type === 'runes') {
         const bestAffordable = [...state.centerRow, ...alwaysAvailableIds.map((id) => createInstance(id, -1))]
           .map((card) => getCard(card.cardId))
           .filter((card) => card.type !== 'monster' && card.cost <= state.turn.runes + effect.amount)
-          .sort((left, right) => rateCard(right) - rateCard(left))[0]
-        score += bestAffordable ? rateCard(bestAffordable) : 0
+          .sort((left, right) => rateCardForAi(strategy, right) - rateCardForAi(strategy, left))[0]
+        score += bestAffordable ? rateCardForAi(strategy, bestAffordable) : 0
       }
 
       if (effect.type === 'power') {
         const bestMonster = state.centerRow
           .map((card) => getCard(card.cardId))
           .filter((card) => card.type === 'monster' && card.cost <= state.turn.power + effect.amount)
-          .sort((left, right) => rateCard(right) - rateCard(left))[0]
-        score += bestMonster ? rateCard(bestMonster) : 0
+          .sort((left, right) => rateCardForAi(strategy, right) - rateCardForAi(strategy, left))[0]
+        score += bestMonster ? rateCardForAi(strategy, bestMonster) : 0
       }
     }
 
@@ -1277,107 +1711,682 @@ function chooseBestOptionId(state: GameState, pending: Extract<PendingChoice, { 
   return bestId
 }
 
-function autoResolvePendingChoice(state: GameState): GameState {
+function autoResolvePendingChoice(state: GameState, strategy: AiStrategy): GameState {
   let next = cloneState(state)
 
-  while (next.pendingChoice) {
+  let safetyCounter = 0
+  while (next.pendingChoice && safetyCounter < 20) {
+    safetyCounter += 1
     const pending = next.pendingChoice
     const player = currentPlayer(next)
 
     switch (pending.type) {
       case 'banish_hand_discard': {
-        const target = pickWeakestPlayerCard(player)
+        const target = pickWeakestPlayerCard(player, strategy)
         next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
         break
       }
       case 'banish_hand': {
         const target = [...player.hand].sort(
-          (left, right) => rateCard(getCard(left.cardId)) - rateCard(getCard(right.cardId)),
+          (left, right) =>
+            rateCardForAi(strategy, getCard(left.cardId)) -
+            rateCardForAi(strategy, getCard(right.cardId)),
         )[0]
-        next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : next
+        next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
         break
       }
       case 'banish_center_row': {
-        const target = pickWorstCenterRowCard(next)
+        const target = pickWorstCenterRowCard(next, strategy)
         next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
+        break
+      }
+      case 'banish_center_row_and_hand_discard': {
+        if (pending.stage === 'center_row') {
+          const target = pickWorstCenterRowCard(next, strategy)
+          next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
+        } else {
+          const target = pickWeakestPlayerCard(player, strategy)
+          next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
+        }
         break
       }
       case 'discard_then_draw': {
         const target = [...player.hand].sort(
-          (left, right) => rateCard(getCard(left.cardId)) - rateCard(getCard(right.cardId)),
+          (left, right) =>
+            rateCardForAi(strategy, getCard(left.cardId)) -
+            rateCardForAi(strategy, getCard(right.cardId)),
         )[0]
-        next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : next
-        if (next.pendingChoice?.type === 'discard_then_draw') {
+        if (target) {
+          next = resolvePendingChoiceWithCard(next, target.instanceId)
+        } else {
           clearPendingChoice(next)
         }
         break
       }
       case 'defeat_monster_upto_cost': {
-        const target = [...next.centerRow]
-          .filter((card) => {
-            const definition = getCard(card.cardId)
-            return definition.type === 'monster' && definition.cost <= pending.maxCost
-          })
-          .sort((left, right) => rateCard(getCard(right.cardId)) - rateCard(getCard(left.cardId)))[0]
-        next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : next
+        const target = [
+          ...[...next.centerRow]
+            .filter((card) => {
+              const definition = getCard(card.cardId)
+              return definition.type === 'monster' && definition.cost <= pending.maxCost
+            })
+            .sort(
+              (left, right) =>
+                rateCardForAi(strategy, getCard(right.cardId)) -
+                rateCardForAi(strategy, getCard(left.cardId)),
+            ),
+          ...(canDefeatCultistForEffect(pending.maxCost)
+            ? ([createInstance(alwaysAvailableMonsterId, -1)] as CardInstance[])
+            : []),
+        ]
+          .sort(
+            (left, right) =>
+              rateCardForAi(strategy, getCard(right.cardId)) -
+              rateCardForAi(strategy, getCard(left.cardId)),
+          )[0]
+        next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
         break
       }
       case 'defeat_any_monster': {
-        const target = [...next.centerRow]
-          .filter((card) => getCard(card.cardId).type === 'monster')
-          .sort((left, right) => rateCard(getCard(right.cardId)) - rateCard(getCard(left.cardId)))[0]
+        const target = [
+          ...next.centerRow.filter((card) => getCard(card.cardId).type === 'monster'),
+          ...(canDefeatCultistForEffect() ? ([createInstance(alwaysAvailableMonsterId, -1)] as CardInstance[]) : []),
+        ]
+          .sort(
+            (left, right) =>
+              rateCardForAi(strategy, getCard(right.cardId)) -
+              rateCardForAi(strategy, getCard(left.cardId)),
+          )[0]
         next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
         break
       }
       case 'acquire_from_center': {
-        const target = pickBestCenterRowCardForAcquire(next, pending.maxCost, pending.cardTypes)
+        const centerTarget = pickBestCenterRowCardForAcquire(next, pending.maxCost, pending.cardTypes, strategy)
+        const reserveTargetId = getAvailableAcquireReserveIds(next, pending.maxCost, pending.cardTypes).sort(
+          (left, right) => rateCardForAi(strategy, getCard(right)) - rateCardForAi(strategy, getCard(left)),
+        )[0]
+        const target =
+          centerTarget &&
+          (!reserveTargetId ||
+            rateCardForAi(strategy, getCard(centerTarget.cardId)) >= rateCardForAi(strategy, getCard(reserveTargetId)))
+            ? centerTarget
+            : reserveTargetId
+              ? createInstance(reserveTargetId, -1)
+              : undefined
         next = target ? resolvePendingChoiceWithCard(next, target.instanceId) : skipPendingChoice(next)
         break
       }
       case 'choose': {
-        const optionId = chooseBestOptionId(next, pending)
-        next = optionId ? resolvePendingChoiceOption(next, optionId) : next
+        const optionId = chooseBestOptionId(next, pending, strategy)
+        next = optionId ? resolvePendingChoiceOption(next, optionId) : skipPendingChoice(next)
         break
       }
     }
   }
 
+  if (next.pendingChoice) {
+    clearPendingChoice(next)
+    addLog(next, `${currentPlayer(next).name} 的待处理效果被自动跳过`)
+  }
+
   return next
 }
 
-function nextMonsterCandidates(state: GameState): CardInstance[] {
+function nextMonsterCandidates(state: GameState, strategy: AiStrategy): CardInstance[] {
   return state.centerRow
     .filter((card) => {
       const definition = getCard(card.cardId)
       return definition.type === 'monster' && definition.cost <= state.turn.power
     })
-    .sort((left, right) => rateCard(getCard(right.cardId)) - rateCard(getCard(left.cardId)))
+    .sort(
+      (left, right) =>
+        rateCardForAi(strategy, getCard(right.cardId)) - rateCardForAi(strategy, getCard(left.cardId)),
+    )
 }
 
-function nextCenterCardCandidates(state: GameState): CardInstance[] {
+function nextCenterCardCandidates(state: GameState, strategy: AiStrategy): CardInstance[] {
   return state.centerRow
     .filter((card) => {
       const definition = getCard(card.cardId)
-      return definition.type !== 'monster' && definition.cost <= state.turn.runes
+      return definition.type !== 'monster' && canAcquireCard(state, definition)
     })
-    .sort((left, right) => rateCard(getCard(right.cardId)) - rateCard(getCard(left.cardId)))
+    .sort(
+      (left, right) =>
+        rateCardForAi(strategy, getCard(right.cardId)) - rateCardForAi(strategy, getCard(left.cardId)),
+    )
 }
 
-function nextReserveCardCandidates(state: GameState): CardDefinition[] {
+function shouldSkipReserveCardForStrategy(
+  player: PlayerState,
+  strategy: AiStrategy,
+  cardId: string,
+): boolean {
+  const isEarlyTurn = player.turnsTaken < 8
+  if (!isEarlyTurn) {
+    return false
+  }
+
+  if (strategy === 'avoid-mystic-first-8' && cardId === 'mystic') {
+    return true
+  }
+
+  if (strategy === 'avoid-heavy-infantry-first-8' && cardId === 'heavy-infantry') {
+    return true
+  }
+
+  return false
+}
+
+function nextReserveCardCandidates(state: GameState, strategy: AiStrategy): CardDefinition[] {
+  const player = currentPlayer(state)
   return alwaysAvailableIds
     .map((cardId) => getCard(cardId))
-    .filter((card) => card.cost <= state.turn.runes)
-    .sort((left, right) => rateCard(right) - rateCard(left))
+    .filter(
+      (card) =>
+        hasReserveSupply(state, card.id) &&
+        canAcquireCard(state, card) &&
+        !shouldSkipReserveCardForStrategy(player, strategy, card.id),
+    )
+    .sort((left, right) => rateCardForAi(strategy, right) - rateCardForAi(strategy, left))
+}
+
+function getBestAffordableCenterCardValue(state: GameState): number {
+  const best = state.centerRow
+    .filter((card) => {
+      const definition = getCard(card.cardId)
+      return definition.type !== 'monster' && canAcquireCard(state, definition)
+    })
+    .map((card) => rateCard(getCard(card.cardId)))
+    .sort((left, right) => right - left)[0]
+
+  return best ?? 0
+}
+
+function getBestAffordableMonsterValue(state: GameState): number {
+  const best = state.centerRow
+    .filter((card) => {
+      const definition = getCard(card.cardId)
+      return definition.type === 'monster' && definition.cost <= state.turn.power
+    })
+    .map((card) => rateCard(getCard(card.cardId)))
+    .sort((left, right) => right - left)[0]
+
+  return best ?? 0
+}
+
+function createEmptyRlFeatures(): RlWeights {
+  return rlFeatureKeys.reduce(
+    (features, key) => {
+      features[key] = 0
+      return features
+    },
+    { ...rlAssassinateGodWeights },
+  )
+}
+
+export function getDefaultRlWeights(): RlWeights {
+  return { ...rlAssassinateGodWeights }
+}
+
+export function getDefaultRlWeightsForStrategy(strategy: AiStrategy): RlWeights {
+  return { ...getRlWeightsForStrategy(strategy) }
+}
+
+function getPlayerById(state: GameState, playerId: string): PlayerState | undefined {
+  return state.players.find((player) => player.id === playerId)
+}
+
+function getOwnedCards(player: PlayerState): CardInstance[] {
+  return [...player.deck, ...player.hand, ...player.discard, ...player.inPlay, ...player.constructs]
+}
+
+function countStarterTrash(player: PlayerState): number {
+  return getOwnedCards(player).filter((card) => card.cardId === 'apprentice' || card.cardId === 'militia').length
+}
+
+function countOwnedCardsByType(player: PlayerState, type: CardType): number {
+  return getOwnedCards(player).filter((card) => getCard(card.cardId).type === type).length
+}
+
+function countOwnedFactionCards(player: PlayerState, faction: Faction): number {
+  return getOwnedCards(player).filter((card) => getCard(card.cardId).faction === faction).length
+}
+
+function findCardDefinitionByInstance(state: GameState, instanceId: string): CardDefinition | undefined {
+  if (instanceId === alwaysAvailableMonsterId || alwaysAvailableIds.includes(instanceId)) {
+    return getCard(instanceId)
+  }
+
+  const player = currentPlayer(state)
+  const card = [
+    ...player.hand,
+    ...player.discard,
+    ...player.inPlay,
+    ...player.constructs,
+    ...state.centerRow,
+  ].find((candidate) => candidate.instanceId === instanceId)
+  return card ? getCard(card.cardId) : undefined
+}
+
+function getDecisionTargetDefinition(state: GameState, decision: AiDecision): CardDefinition | undefined {
+  switch (decision.kind) {
+    case 'play_card':
+    case 'activate_construct':
+    case 'acquire_center':
+    case 'defeat_center_monster':
+    case 'resolve_pending_card':
+      return findCardDefinitionByInstance(state, decision.instanceId)
+    case 'acquire_reserve':
+      return getCard(decision.cardId)
+    case 'defeat_cultist':
+      return getCard(alwaysAvailableMonsterId)
+    case 'resolve_pending_option':
+    case 'skip_pending':
+    case 'end_turn':
+      return undefined
+  }
+}
+
+function dotRlFeatures(weights: RlWeights, features: RlWeights): number {
+  return rlFeatureKeys.reduce((total, key) => total + weights[key] * features[key], 0)
+}
+
+function evaluateImmediateRlDecisions(
+  state: GameState,
+  weights: RlWeights,
+): Array<Omit<RlDecisionEvaluation, 'continuationValue' | 'qValue'>> {
+  const playerId = currentPlayer(state).id
+
+  return listAiDecisions(state, 'rl-assassinate-god')
+    .map((decision) => {
+      const nextState = applyAiDecision(state, decision)
+      const features = buildRlFeatures(state, nextState, playerId, decision)
+      const immediateValue = dotRlFeatures(weights, features)
+      return {
+        decision,
+        nextState,
+        features,
+        immediateValue,
+      }
+    })
+    .sort((left, right) => right.immediateValue - left.immediateValue)
+}
+
+function estimateRlContinuationValue(
+  state: GameState,
+  rlPlayerId: string,
+  weights: RlWeights,
+): number {
+  let next = cloneState(state)
+  let transitions = 0
+
+  while (!next.gameOver && transitions < RL_LOOKAHEAD_MAX_TRANSITIONS) {
+    if (currentPlayer(next).id === rlPlayerId) {
+      const evaluations = evaluateImmediateRlDecisions(next, weights)
+      return evaluations[0]?.immediateValue ?? 0
+    }
+
+    const stepped = runAiStep(next)
+    if (JSON.stringify(stepped) === JSON.stringify(next)) {
+      const forcedEnd = endTurn(next)
+      if (JSON.stringify(forcedEnd) === JSON.stringify(next)) {
+        break
+      }
+      next = forcedEnd
+    } else {
+      next = stepped
+    }
+
+    transitions += 1
+  }
+
+  if (next.gameOver) {
+    const scoreboard = getScoreboard(next)
+    const myScore = scoreboard.find((entry) => entry.id === rlPlayerId)?.score ?? 0
+    const bestScore = scoreboard[0]?.score ?? 0
+    return next.winnerIds.includes(rlPlayerId) ? 25 : myScore - bestScore
+  }
+
+  return 0
+}
+
+function buildRlFeatures(
+  state: GameState,
+  nextState: GameState,
+  playerId: string,
+  decision: AiDecision,
+): RlWeights {
+  const previousPlayer = getPlayerById(state, playerId)
+  const nextPlayer = getPlayerById(nextState, playerId)
+  const targetDefinition = getDecisionTargetDefinition(state, decision)
+  const features = createEmptyRlFeatures()
+  const actingPlayer = currentPlayer(state)
+  const bestAffordableCenterCardValue = getBestAffordableCenterCardValue(state) / 10
+  const bestAffordableMonsterValue = getBestAffordableMonsterValue(state) / 10
+
+  if (!previousPlayer || !nextPlayer) {
+    return features
+  }
+
+  features.bias = 1
+  features.immediateScore = calculateScore(nextPlayer) - calculateScore(previousPlayer)
+  features.immediateHonor = nextPlayer.honor - previousPlayer.honor
+  features.immediateRunes = Math.max(0, nextState.turn.runes - state.turn.runes)
+  features.immediatePower = Math.max(0, nextState.turn.power - state.turn.power)
+  features.drawCards = Math.max(
+    0,
+    (nextState.turn.cardsDrawnThisTurn ?? 0) - (state.turn.cardsDrawnThisTurn ?? 0),
+  )
+  features.starterTrashRemoved = Math.max(0, countStarterTrash(previousPlayer) - countStarterTrash(nextPlayer))
+  features.gainsConstruct = Math.max(0, nextPlayer.constructs.length - previousPlayer.constructs.length)
+  features.gainsHero = Math.max(
+    0,
+    countOwnedCardsByType(nextPlayer, 'hero') - countOwnedCardsByType(previousPlayer, 'hero'),
+  )
+  features.pendingResolved = state.pendingChoice && !nextState.pendingChoice ? 1 : 0
+  features.endTurnPenalty = decision.kind === 'end_turn' ? 1 : 0
+  features.resourceWasteRunes = decision.kind === 'end_turn' ? state.turn.runes : 0
+  features.resourceWastePower = decision.kind === 'end_turn' ? state.turn.power : 0
+  features.handCardsLeft = decision.kind === 'end_turn' ? actingPlayer.hand.length : 0
+  features.reserveInsteadOfCenterPenalty =
+    decision.kind === 'acquire_reserve' ? bestAffordableCenterCardValue : 0
+  features.cultistInsteadOfMonsterPenalty =
+    decision.kind === 'defeat_cultist' ? bestAffordableMonsterValue : 0
+
+  if (targetDefinition) {
+    if (targetDefinition.type === 'monster') {
+      features.targetMonsterValue = rateCard(targetDefinition) / 10
+      features.defeatsMonster = 1
+      if (targetDefinition.id === FALLEN_GOD_ID) {
+        features.defeatsFallenGod = 1
+      }
+      if (decision.kind === 'defeat_cultist') {
+        features.defeatsCultist = 1
+      }
+    } else {
+      features.targetCardValue = rateCard(targetDefinition) / 10
+      if (targetDefinition.type === 'construct') {
+        features.gainsConstruct += 1
+      }
+      if (targetDefinition.type === 'hero') {
+        features.gainsHero += 1
+      }
+      if (targetDefinition.faction === 'void') {
+        features.voidSynergy = countOwnedFactionCards(nextPlayer, 'void')
+      }
+      if (targetDefinition.faction === 'mechana') {
+        features.mechanaSynergy = countOwnedFactionCards(nextPlayer, 'mechana')
+      }
+      if (decision.kind === 'acquire_reserve' && targetDefinition.id === 'mystic') {
+        features.reserveMysticPenalty = 1
+      }
+      if (decision.kind === 'acquire_reserve' && targetDefinition.id === 'heavy-infantry') {
+        features.reserveHeavyInfantryBonus = 1
+      }
+    }
+  }
+
+  return features
+}
+
+function applyAiDecision(state: GameState, decision: AiDecision): GameState {
+  switch (decision.kind) {
+    case 'play_card':
+      return playCard(state, decision.instanceId)
+    case 'activate_construct':
+      return activateConstruct(state, decision.instanceId)
+    case 'acquire_center':
+      return acquireCenterCard(state, decision.instanceId)
+    case 'acquire_reserve':
+      return acquireAlwaysAvailable(state, decision.cardId)
+    case 'defeat_center_monster':
+      return defeatCenterMonster(state, decision.instanceId)
+    case 'defeat_cultist':
+      return defeatCultist(state)
+    case 'resolve_pending_card':
+      return resolvePendingChoiceWithCard(state, decision.instanceId)
+    case 'resolve_pending_option':
+      return resolvePendingChoiceOption(state, decision.optionId)
+    case 'skip_pending':
+      return skipPendingChoice(state)
+    case 'end_turn':
+      return endTurn(state)
+  }
+}
+
+function listAiDecisions(state: GameState, strategy: AiStrategy): AiDecision[] {
+  if (state.gameOver) {
+    return []
+  }
+
+  const player = currentPlayer(state)
+
+  if (state.pendingChoice) {
+    const pending = state.pendingChoice
+
+    switch (pending.type) {
+      case 'banish_hand_discard':
+        return [
+          ...[...player.hand, ...player.discard].map((card) => ({
+            kind: 'resolve_pending_card' as const,
+            instanceId: card.instanceId,
+          })),
+          ...(pending.optional ? [{ kind: 'skip_pending' as const }] : []),
+        ]
+      case 'banish_hand':
+        return player.hand.map((card) => ({
+          kind: 'resolve_pending_card' as const,
+          instanceId: card.instanceId,
+        }))
+      case 'banish_center_row':
+        return [
+          ...state.centerRow.map((card) => ({
+            kind: 'resolve_pending_card' as const,
+            instanceId: card.instanceId,
+          })),
+          ...(pending.optional ? [{ kind: 'skip_pending' as const }] : []),
+        ]
+      case 'banish_center_row_and_hand_discard':
+        return [
+          ...(pending.stage === 'center_row'
+            ? state.centerRow.map((card) => ({
+                kind: 'resolve_pending_card' as const,
+                instanceId: card.instanceId,
+              }))
+            : [...player.hand, ...player.discard].map((card) => ({
+                kind: 'resolve_pending_card' as const,
+                instanceId: card.instanceId,
+              }))),
+          ...(pending.optional ? [{ kind: 'skip_pending' as const }] : []),
+        ]
+      case 'discard_then_draw':
+        return player.hand.map((card) => ({
+          kind: 'resolve_pending_card' as const,
+          instanceId: card.instanceId,
+        }))
+      case 'defeat_monster_upto_cost':
+        return [
+          ...state.centerRow
+            .filter((card) => {
+              const definition = getCard(card.cardId)
+              return definition.type === 'monster' && definition.cost <= pending.maxCost
+            })
+            .map((card) => ({
+              kind: 'resolve_pending_card' as const,
+              instanceId: card.instanceId,
+            })),
+          ...(canDefeatCultistForEffect(pending.maxCost)
+            ? [{ kind: 'resolve_pending_card' as const, instanceId: alwaysAvailableMonsterId }]
+            : []),
+        ]
+      case 'defeat_any_monster':
+        return [
+          ...state.centerRow
+            .filter((card) => getCard(card.cardId).type === 'monster')
+            .map((card) => ({
+              kind: 'resolve_pending_card' as const,
+              instanceId: card.instanceId,
+            })),
+          ...(canDefeatCultistForEffect()
+            ? [{ kind: 'resolve_pending_card' as const, instanceId: alwaysAvailableMonsterId }]
+            : []),
+          ...(pending.optional ? [{ kind: 'skip_pending' as const }] : []),
+        ]
+      case 'acquire_from_center':
+        return [
+          ...state.centerRow
+            .filter((card) => matchesAcquireFilter(getCard(card.cardId), pending.maxCost, pending.cardTypes))
+            .map((card) => ({
+              kind: 'resolve_pending_card' as const,
+              instanceId: card.instanceId,
+            })),
+          ...getAvailableAcquireReserveIds(state, pending.maxCost, pending.cardTypes).map((cardId) => ({
+            kind: 'resolve_pending_card' as const,
+            instanceId: cardId,
+          })),
+          ...(pending.optional ? [{ kind: 'skip_pending' as const }] : []),
+        ]
+      case 'choose':
+        return pending.options.map((option) => ({
+          kind: 'resolve_pending_option' as const,
+          optionId: option.id,
+        }))
+    }
+  }
+
+  const decisions: AiDecision[] = []
+
+  decisions.push(
+    ...player.hand.map((card) => ({
+      kind: 'play_card' as const,
+      instanceId: card.instanceId,
+    })),
+  )
+
+  decisions.push(
+    ...player.constructs
+      .filter(
+        (card) =>
+          getCard(card.cardId).activatedEffects?.length &&
+          !(state.turn.activatedConstructIds ?? []).includes(card.instanceId),
+      )
+      .map((card) => ({
+        kind: 'activate_construct' as const,
+        instanceId: card.instanceId,
+      })),
+  )
+
+  decisions.push(
+    ...state.centerRow
+      .filter((card) => {
+        const definition = getCard(card.cardId)
+        return definition.type === 'monster' && definition.cost <= state.turn.power
+      })
+      .map((card) => ({
+        kind: 'defeat_center_monster' as const,
+        instanceId: card.instanceId,
+      })),
+  )
+
+  decisions.push(
+    ...state.centerRow
+      .filter((card) => {
+        const definition = getCard(card.cardId)
+        return definition.type !== 'monster' && canAcquireCard(state, definition)
+      })
+      .map((card) => ({
+        kind: 'acquire_center' as const,
+        instanceId: card.instanceId,
+      })),
+  )
+
+  decisions.push(
+    ...alwaysAvailableIds
+      .filter((cardId) => {
+        const definition = getCard(cardId)
+        if (cardId === 'mystic' && state.reserveSupply.mystic <= 0) {
+          return false
+        }
+        if (cardId === 'heavy-infantry' && state.reserveSupply['heavy-infantry'] <= 0) {
+          return false
+        }
+        return (
+          canAcquireCard(state, definition) &&
+          !shouldSkipReserveCardForStrategy(player, strategy, definition.id)
+        )
+      })
+      .map((cardId) => ({
+        kind: 'acquire_reserve' as const,
+        cardId,
+      })),
+  )
+
+  if (state.turn.power >= getCard(alwaysAvailableMonsterId).cost) {
+    decisions.push({ kind: 'defeat_cultist' })
+  }
+
+  decisions.push({ kind: 'end_turn' })
+  return decisions
+}
+
+export function evaluateRlDecisions(
+  state: GameState,
+  weights: RlWeights = rlAssassinateGodWeights,
+): RlDecisionEvaluation[] {
+  const playerId = currentPlayer(state).id
+  return evaluateImmediateRlDecisions(state, weights)
+    .map((evaluation) => {
+      const continuationValue = estimateRlContinuationValue(evaluation.nextState, playerId, weights)
+      return {
+        ...evaluation,
+        continuationValue,
+        qValue: evaluation.immediateValue + continuationValue * RL_LOOKAHEAD_DISCOUNT,
+      }
+    })
+    .sort((left, right) => right.qValue - left.qValue)
+}
+
+export function chooseRlDecision(
+  state: GameState,
+  weights: RlWeights = rlAssassinateGodWeights,
+  epsilon = 0,
+): RlDecisionEvaluation | undefined {
+  const evaluations = evaluateRlDecisions(state, weights)
+  if (evaluations.length === 0) {
+    return undefined
+  }
+
+  if (epsilon > 0 && Math.random() < epsilon) {
+    const randomIndex = Math.floor(Math.random() * evaluations.length)
+    return evaluations[randomIndex]
+  }
+
+  return evaluations[0]
+}
+
+export function runRlStrategyStep(
+  state: GameState,
+  weights: RlWeights = rlAssassinateGodWeights,
+  epsilon = 0,
+): GameState {
+  const choice = chooseRlDecision(state, weights, epsilon)
+  return choice?.nextState ?? state
 }
 
 export function runAiStep(state: GameState): GameState {
-  let next = cloneState(state)
+  const next = cloneState(state)
   if (next.gameOver || !currentPlayer(next).isAi) {
     return next
   }
 
+  const strategy = currentPlayer(next).aiStrategy ?? 'standard'
+
+  if (isRlStrategy(strategy)) {
+    return runRlStrategyStep(next, getRlWeightsForStrategy(strategy))
+  }
+
   if (next.pendingChoice) {
-    return autoResolvePendingChoice(next)
+    return autoResolvePendingChoice(next, strategy)
   }
 
   const aiPlayer = currentPlayer(next)
@@ -1386,24 +2395,38 @@ export function runAiStep(state: GameState): GameState {
   }
 
   const activatableConstructs = currentPlayer(next).constructs.filter(
-    (card) => getCard(card.cardId).activatedEffects?.length,
+    (card) =>
+      getCard(card.cardId).activatedEffects?.length &&
+      !(next.turn.activatedConstructIds ?? []).includes(card.instanceId),
   )
   if (activatableConstructs.length > 0) {
     return activateConstruct(next, activatableConstructs[0].instanceId)
   }
 
-  const affordableMonsters = nextMonsterCandidates(next)
+  const affordableMonsters = nextMonsterCandidates(next, strategy)
   if (affordableMonsters.length > 0) {
     return defeatCenterMonster(next, affordableMonsters[0].instanceId)
   }
 
-  const affordableCenterCards = nextCenterCardCandidates(next)
-  const affordableReserveCards = nextReserveCardCandidates(next)
+  const affordableCenterCards = nextCenterCardCandidates(next, strategy)
+  const affordableReserveCards = nextReserveCardCandidates(next, strategy)
   const bestCenter = affordableCenterCards[0]
   const bestReserve = affordableReserveCards[0]
 
-  if (bestCenter && (!bestReserve || rateCard(getCard(bestCenter.cardId)) >= rateCard(bestReserve))) {
+  if (
+    bestCenter &&
+    (!bestReserve ||
+      rateCardForAi(strategy, getCard(bestCenter.cardId)) >= rateCardForAi(strategy, bestReserve))
+  ) {
     return acquireCenterCard(next, bestCenter.instanceId)
+  }
+
+  if (strategy === 'speedrun' && affordableCenterCards.length === 0) {
+    const heavy = getCard('heavy-infantry')
+    if (hasReserveSupply(next, heavy.id) && canAcquireCard(next, heavy)) {
+      // In speedrun mode, if we can't buy from the center row, prioritize Heavy Infantry.
+      return acquireAlwaysAvailable(next, heavy.id)
+    }
   }
 
   if (bestReserve) {
@@ -1450,6 +2473,7 @@ export function debugSetTurnResources(state: GameState, runes: number, power: nu
   }
 
   next.turn.runes = Math.max(0, Math.floor(runes))
+  next.turn.mechanaRunes = 0
   next.turn.power = Math.max(0, Math.floor(power))
   addLog(next, `Debug：设置资源为 ${next.turn.runes} 符文 / ${next.turn.power} 力量`)
   return next
@@ -1466,6 +2490,20 @@ export function debugAddCardToCenterDeck(state: GameState, cardId: string): Game
   // Add to the top of the center deck so it appears next time a slot refills.
   next.centerDeck.unshift(createInstance(cardId, next.seed))
   addLog(next, `Debug：已将 ${definition.name} 放入中央牌堆顶`)
+  return next
+}
+
+export function debugAddCardToHand(state: GameState, cardId: string): GameState {
+  const next = cloneState(state)
+  if (next.gameOver) {
+    return next
+  }
+
+  const player = currentPlayer(next)
+  const definition = getCard(cardId)
+  next.seed += 1
+  player.hand.push(createInstance(cardId, next.seed))
+  addLog(next, `Debug：已将 ${definition.name} 加入 ${player.name} 的手牌`)
   return next
 }
 

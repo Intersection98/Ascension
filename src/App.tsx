@@ -9,9 +9,11 @@ import {
   getCard,
 } from './game/cards'
 import {
+  debugAddCardToHand,
   acquireAlwaysAvailable,
   acquireCenterCard,
   activateConstruct,
+  canAcquireCard,
   createGame,
   defeatCenterMonster,
   defeatCultist,
@@ -31,10 +33,19 @@ import {
 } from './game/engine'
 import type { CardDefinition, GameState, PlayerConfig } from './game/types'
 
-const defaultPlayers: PlayerConfig[] = [
-  { name: '玩家 1', isAi: false },
-  { name: '电脑 1', isAi: true },
-]
+function createDefaultPlayerConfig(index: number): PlayerConfig {
+  if (index === 0) {
+    return { name: '玩家 1', isAi: false }
+  }
+
+  return {
+    name: `电脑 ${index}`,
+    isAi: true,
+    aiStrategy: 'standard',
+  }
+}
+
+const defaultPlayers: PlayerConfig[] = [createDefaultPlayerConfig(0), createDefaultPlayerConfig(1)]
 
 function resizePlayers(players: PlayerConfig[], count: number): PlayerConfig[] {
   return Array.from({ length: count }, (_, index) => {
@@ -43,10 +54,7 @@ function resizePlayers(players: PlayerConfig[], count: number): PlayerConfig[] {
       return existing
     }
 
-    return {
-      name: `玩家 ${index + 1}`,
-      isAi: false,
-    }
+    return createDefaultPlayerConfig(index)
   })
 }
 
@@ -63,6 +71,197 @@ function getCardClassName(definition: CardDefinition) {
   }
 }
 
+function parseAiStrategy(value: string): PlayerConfig['aiStrategy'] {
+  switch (value) {
+    case 'speedrun':
+    case 'avoid-mystic-first-8':
+    case 'avoid-heavy-infantry-first-8':
+    case 'rl-assassinate-god':
+    case 'rl-standard':
+    case 'rl-versatile':
+      return value
+    default:
+      return 'standard'
+  }
+}
+
+type ParsedLogEntry = {
+  raw: string
+  actor?: string
+  action: 'buy' | 'defeat' | 'play' | 'draw' | 'turn' | 'other'
+  subject?: string
+  source?: string
+  label: string
+  isFree?: boolean
+  isReserve?: boolean
+}
+
+function parseLogEntry(entry: string): ParsedLogEntry {
+  let match = entry.match(/^(.*?) 通过 (.*?) 免费获得了常驻牌 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'buy',
+      source: match[2],
+      subject: match[3],
+      label: '免费买常驻',
+      isFree: true,
+      isReserve: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 通过 (.*?) 免费获得了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'buy',
+      source: match[2],
+      subject: match[3],
+      label: '免费买牌',
+      isFree: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 购买了常驻卡 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'buy',
+      subject: match[2],
+      label: '买常驻',
+      isReserve: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 购买了 (.*?) 并将其加入手牌$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'buy',
+      subject: `${match[2]}（入手牌）`,
+      label: '买牌',
+    }
+  }
+
+  match = entry.match(/^(.*?) 购买了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'buy',
+      subject: match[2],
+      label: '买牌',
+    }
+  }
+
+  match = entry.match(/^(.*?) 通过 (.*?) 免费击败了常驻怪物 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'defeat',
+      source: match[2],
+      subject: match[3],
+      label: '免费打常驻',
+      isFree: true,
+      isReserve: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 通过 (.*?) 免费击败了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'defeat',
+      source: match[2],
+      subject: match[3],
+      label: '免费打怪',
+      isFree: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 击败了常驻怪物 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'defeat',
+      subject: match[2],
+      label: '打常驻',
+      isReserve: true,
+    }
+  }
+
+  match = entry.match(/^(.*?) 击败了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'defeat',
+      subject: match[2],
+      label: '打怪',
+    }
+  }
+
+  match = entry.match(/^(.*?) 打出了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'play',
+      subject: match[2],
+      label: '打出',
+    }
+  }
+
+  match = entry.match(/^(.*?) (?:通过 .*?)?抽了 (.*)$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'draw',
+      subject: match[2],
+      label: '抽牌',
+    }
+  }
+
+  match = entry.match(/^轮到 (.*?) 行动$/)
+  if (match) {
+    return {
+      raw: entry,
+      actor: match[1],
+      action: 'turn',
+      label: '回合开始',
+    }
+  }
+
+  return {
+    raw: entry,
+    action: 'other',
+    label: '日志',
+  }
+}
+
+function getActionTone(action: ParsedLogEntry['action']) {
+  switch (action) {
+    case 'buy':
+      return 'buy'
+    case 'defeat':
+      return 'defeat'
+    case 'play':
+      return 'play'
+    case 'draw':
+      return 'draw'
+    default:
+      return 'neutral'
+  }
+}
+
 function App() {
   const [playerConfigs, setPlayerConfigs] = useState<PlayerConfig[]>(defaultPlayers)
   const [game, setGame] = useState<GameState>(() => createGame(defaultPlayers))
@@ -73,6 +272,9 @@ function App() {
   const [reservePulseKind, setReservePulseKind] = useState<'buy' | 'defeat'>('buy')
   const [marketPulseKind, setMarketPulseKind] = useState<'buy' | 'defeat'>('buy')
   const [marketPulse, setMarketPulse] = useState(false)
+  const [headlineBuyPulse, setHeadlineBuyPulse] = useState(false)
+  const [marketToastText, setMarketToastText] = useState<string | null>(null)
+  const [reserveToastText, setReserveToastText] = useState<string | null>(null)
   const [showDiscard, setShowDiscard] = useState(false)
   const [inspectPlayerId, setInspectPlayerId] = useState<string | null>(null)
   const [debugCardName, setDebugCardName] = useState('')
@@ -83,7 +285,23 @@ function App() {
   const pendingChoice = getPendingChoice(game)
   const playableHand = getPlayableHand(game)
   const scoreboard = useMemo(() => getScoreboard(game), [game])
+  const scoreboardBySeat = useMemo(() => {
+    const scoreboardMap = new Map(scoreboard.map((entry) => [entry.id, entry]))
+    return game.players.flatMap((player) => {
+      const entry = scoreboardMap.get(player.id)
+      return entry ? [entry] : []
+    })
+  }, [game.players, scoreboard])
   const latestLog = game.log[0]
+  const parsedLog = useMemo(() => game.log.map((entry) => parseLogEntry(entry)), [game.log])
+  const actionHighlights = useMemo(
+    () =>
+      parsedLog
+        .filter((entry) => entry.actor && (entry.action === 'buy' || entry.action === 'defeat' || entry.action === 'play'))
+        .slice(0, 8),
+    [parsedLog],
+  )
+  const latestHeadlineAction = actionHighlights[0]
   const lastSeenLogHeadRef = useRef<string | null>(null)
   const currentTurnNumber = currentPlayer.turnsTaken + 1
   const discardPreview = useMemo(() => {
@@ -121,18 +339,80 @@ function App() {
       }))
     }
 
+    if (pendingChoice.type === 'banish_center_row_and_hand_discard') {
+      return pendingChoice.stage === 'center_row'
+        ? game.centerRow.map((card) => ({
+            ...card,
+            zoneLabel: '中心牌列',
+          }))
+        : [
+            ...currentPlayer.hand.map((card) => ({
+              ...card,
+              zoneLabel: '手牌',
+            })),
+            ...currentPlayer.discard.map((card) => ({
+              ...card,
+              zoneLabel: '弃牌堆',
+            })),
+          ]
+    }
+
     if (pendingChoice.type === 'defeat_monster_upto_cost' || pendingChoice.type === 'defeat_any_monster') {
-      return game.centerRow.map((card) => ({
-        ...card,
-        zoneLabel: '中心牌列',
-      }))
+      return [
+        ...game.centerRow
+          .filter((card) => {
+            const definition = getCard(card.cardId)
+            return (
+              definition.type === 'monster' &&
+              (pendingChoice.type !== 'defeat_monster_upto_cost' || definition.cost <= pendingChoice.maxCost)
+            )
+          })
+          .map((card) => ({
+            ...card,
+            zoneLabel: '中心牌列',
+          })),
+        ...(pendingChoice.type !== 'defeat_monster_upto_cost' ||
+        getCard(alwaysAvailableMonsterId).cost <= pendingChoice.maxCost
+          ? [
+              {
+                instanceId: alwaysAvailableMonsterId,
+                cardId: alwaysAvailableMonsterId,
+                zoneLabel: '常驻怪物',
+              },
+            ]
+          : []),
+      ]
     }
 
     if (pendingChoice.type === 'acquire_from_center') {
-      return game.centerRow.map((card) => ({
-        ...card,
-        zoneLabel: '中心牌列',
-      }))
+      return [
+        ...game.centerRow
+          .filter((card) => {
+            const definition = getCard(card.cardId)
+            return (
+              definition.type !== 'monster' &&
+              definition.cost <= pendingChoice.maxCost &&
+              (!pendingChoice.cardTypes || pendingChoice.cardTypes.includes(definition.type))
+            )
+          })
+          .map((card) => ({
+            ...card,
+            zoneLabel: '中心牌列',
+          })),
+        ...alwaysAvailableIds
+          .filter((cardId) => {
+            const definition = getCard(cardId)
+            return (
+              definition.cost <= pendingChoice.maxCost &&
+              (!pendingChoice.cardTypes || pendingChoice.cardTypes.includes(definition.type))
+            )
+          })
+          .map((cardId) => ({
+            instanceId: cardId,
+            cardId,
+            zoneLabel: '常驻牌',
+          })),
+      ]
     }
 
     if (pendingChoice.type === 'discard_then_draw') {
@@ -198,6 +478,12 @@ function App() {
     const hasMarketDefeat = newLogs.some(
       (entry) => entry.includes('击败了') && !entry.includes('击败了常驻怪物'),
     )
+    const marketBuyEntry = newLogs.find(
+      (entry) =>
+        (entry.includes('购买了') || entry.includes('免费获得了')) &&
+        !entry.includes('购买了常驻卡') &&
+        !entry.includes('免费获得了常驻牌'),
+    )
     const reserveEntry = newLogs.find(
       (entry) => entry.includes('购买了常驻卡') || entry.includes('击败了常驻怪物'),
     )
@@ -207,6 +493,16 @@ function App() {
       setMarketPulseKind('buy')
       restartPulse(setMarketPulse)
       restartPulse(setBuyPulse)
+      restartPulse(setHeadlineBuyPulse, 780)
+      if (marketBuyEntry) {
+        const parsedEntry = parseLogEntry(marketBuyEntry)
+        setMarketToastText(`${parsedEntry.actor} 买入 ${parsedEntry.subject}`)
+        timeouts.push(
+          window.setTimeout(() => {
+            setMarketToastText(null)
+          }, 1100),
+        )
+      }
     }
 
     if (hasMarketDefeat) {
@@ -230,6 +526,17 @@ function App() {
           setReservePulseCardId(null)
         }, 520),
       )
+
+      if (pulseKind === 'buy') {
+        restartPulse(setHeadlineBuyPulse, 780)
+        const parsedEntry = parseLogEntry(reserveEntry)
+        setReserveToastText(`${parsedEntry.actor} 买入 ${parsedEntry.subject}`)
+        timeouts.push(
+          window.setTimeout(() => {
+            setReserveToastText(null)
+          }, 1100),
+        )
+      }
     }
 
     if (hasDraw) {
@@ -324,6 +631,7 @@ function App() {
     const sanitized = playerConfigs.map((player, index) => ({
       name: player.name.trim() || (player.isAi ? `电脑 ${index + 1}` : `玩家 ${index + 1}`),
       isAi: player.isAi,
+      aiStrategy: player.isAi ? player.aiStrategy ?? 'standard' : undefined,
     }))
     setPlayerConfigs(sanitized)
     setGame(createGame(sanitized))
@@ -369,6 +677,19 @@ function App() {
             </strong>
           </div>
         </div>
+        <div className="headline-banner">
+          <span
+            className={`headline-badge tone-${latestHeadlineAction ? getActionTone(latestHeadlineAction.action) : 'neutral'} ${headlineBuyPulse ? 'headline-badge-pop' : ''}`}
+          >
+            {latestHeadlineAction?.label ?? '等待动作'}
+          </span>
+          <strong className={headlineBuyPulse ? 'headline-buy-text' : undefined}>
+            {latestHeadlineAction?.actor && latestHeadlineAction?.subject
+              ? `${latestHeadlineAction.actor}：${latestHeadlineAction.subject}`
+              : latestLog ?? '对局开始后，买牌和打怪会在这里高亮显示。'}
+          </strong>
+          {latestHeadlineAction?.source ? <small>来源：{latestHeadlineAction.source}</small> : null}
+        </div>
       </section>
 
       <div className="table-layout">
@@ -386,12 +707,16 @@ function App() {
                     ? '请选择 1 张手牌进行放逐。'
                   : pendingChoice.type === 'banish_center_row'
                     ? '请选择 1 张中心牌列中的牌进行放逐。'
+                  : pendingChoice.type === 'banish_center_row_and_hand_discard'
+                    ? pendingChoice.stage === 'center_row'
+                      ? '你可以先选择 1 张中心牌列中的牌进行放逐，之后还可以再放逐 1 张手牌或弃牌堆中的牌。'
+                      : '你还可以选择 1 张手牌或弃牌堆中的牌进行放逐。'
                     : pendingChoice.type === 'defeat_monster_upto_cost'
-                      ? `请选择 1 个费用 ${pendingChoice.maxCost} 或以下的怪物免费击败。`
+                      ? `请选择 1 个费用 ${pendingChoice.maxCost} 或以下的怪物免费击败。也可以选择邪教徒。`
                       : pendingChoice.type === 'defeat_any_monster'
-                        ? '请选择 1 个怪物免费击败。'
+                        ? '请选择 1 个怪物免费击败。也可以选择邪教徒。'
                     : pendingChoice.type === 'acquire_from_center'
-                      ? `请选择 1 张费用 ${pendingChoice.maxCost} 或以下的中心牌列卡牌免费获得。`
+                      ? `请选择 1 张费用 ${pendingChoice.maxCost} 或以下的卡牌免费获得，也可以选择符合条件的常驻牌。`
                       : pendingChoice.type === 'discard_then_draw'
                         ? `请选择 ${pendingChoice.discard} 张手牌弃掉，然后抽 ${pendingChoice.draw} 张牌。`
                         : 'label' in pendingChoice
@@ -406,9 +731,12 @@ function App() {
               marketPulse ? (marketPulseKind === 'defeat' ? 'panel-defeat-pulse' : 'panel-buy-pulse') : ''
             }`}
           >
+            {marketToastText ? <div className="action-toast action-toast-buy">{marketToastText}</div> : null}
             <div className="section-header compact-header">
               <h2>中央牌列</h2>
-              <p>英雄与神器用符文购买，怪物用力量击败。</p>
+              <p>
+                英雄与神器用符文购买，怪物用力量击败。中央牌库剩余 {game.centerDeck.length} 张。
+              </p>
             </div>
             <div className="market-scroll-row center-row-grid">
               {game.centerRow.map((card) => {
@@ -418,7 +746,7 @@ function App() {
                   !game.gameOver &&
                   !pendingChoice &&
                   definition.type !== 'monster' &&
-                  game.turn.runes >= definition.cost
+                  canAcquireCard(game, definition)
                 const canDefeat =
                   !currentPlayer.isAi &&
                   !game.gameOver &&
@@ -448,9 +776,10 @@ function App() {
               reservePulseKind === 'defeat' ? 'panel-defeat-pulse' : ''
             }`}
           >
+            {reserveToastText ? <div className="action-toast action-toast-buy">{reserveToastText}</div> : null}
             <div className="section-header compact-header">
               <h2>常驻牌与怪物</h2>
-              <p>这里始终可以买秘法师、重装步兵，或击败邪教徒。</p>
+              <p>这里始终可以买秘教士、重装步兵，或击败邪教徒。</p>
             </div>
             <div className="market-scroll-row reserve-row-grid">
               {alwaysAvailableIds.map((cardId) =>
@@ -463,7 +792,10 @@ function App() {
                     currentPlayer.isAi ||
                     game.gameOver ||
                     Boolean(pendingChoice) ||
-                    game.turn.runes < getCard(cardId).cost,
+                    (cardId === 'mystic'
+                      ? game.reserveSupply.mystic <= 0
+                      : game.reserveSupply['heavy-infantry'] <= 0) ||
+                    !canAcquireCard(game, getCard(cardId)),
                   onAction: () => setGame((prev) => acquireAlwaysAvailable(prev, cardId)),
                 }),
               )}
@@ -500,7 +832,12 @@ function App() {
               <div className="hand-status-chip">
                 <span>当前资源</span>
                 <strong>
-                  {game.turn.runes} 符文 / {game.turn.power} 力量
+                  {game.turn.runes} 符文
+                  {(game.turn.mechanaRunes ?? 0) > 0
+                    ? ` + ${game.turn.mechanaRunes ?? 0} 机械限定符文`
+                    : ''}
+                  {' / '}
+                  {game.turn.power} 力量
                 </strong>
               </div>
               <div className="hand-status-chip">
@@ -613,6 +950,7 @@ function App() {
             {pendingChoice &&
             (pendingChoice.type === 'banish_hand_discard' ||
               pendingChoice.type === 'banish_center_row' ||
+              pendingChoice.type === 'banish_center_row_and_hand_discard' ||
               pendingChoice.type === 'acquire_from_center') ? (
               <div className="action-row single-row">
                 <button
@@ -670,13 +1008,38 @@ function App() {
                       <select
                         value={player.isAi ? 'ai' : 'human'}
                         onChange={(event) =>
-                          updatePlayer(index, { isAi: event.target.value === 'ai' })
+                          updatePlayer(index, {
+                            isAi: event.target.value === 'ai',
+                            aiStrategy:
+                              event.target.value === 'ai' ? player.aiStrategy ?? 'standard' : undefined,
+                          })
                         }
                       >
                         <option value="human">真人</option>
                         <option value="ai">电脑</option>
                       </select>
                     </label>
+                    {player.isAi ? (
+                      <label>
+                        策略
+                        <select
+                          value={player.aiStrategy ?? 'standard'}
+                          onChange={(event) =>
+                            updatePlayer(index, {
+                              aiStrategy: parseAiStrategy(event.target.value),
+                            })
+                          }
+                        >
+                          <option value="standard">标准</option>
+                          <option value="speedrun">速刷</option>
+                          <option value="avoid-mystic-first-8">不买秘教士</option>
+                          <option value="avoid-heavy-infantry-first-8">不买重装步兵</option>
+                          <option value="rl-assassinate-god">RL 暗杀神</option>
+                          <option value="rl-standard">RL（标准）</option>
+                          <option value="rl-versatile">RL（通用）</option>
+                        </select>
+                      </label>
+                    ) : null}
                   </div>
                 ))}
               </div>
@@ -716,6 +1079,26 @@ function App() {
                 >
                   放入中央牌堆顶
                 </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const name = debugCardName.trim()
+                    if (!name) {
+                      return
+                    }
+                    const exact = cardDefinitions.find((card) => card.name === name)
+                    const fuzzy = exact
+                      ? undefined
+                      : cardDefinitions.find((card) => card.name.includes(name))
+                    const target = exact ?? fuzzy
+                    if (!target) {
+                      return
+                    }
+                    setGame((prev) => debugAddCardToHand(prev, target.id))
+                  }}
+                >
+                  加入当前手牌
+                </button>
               </div>
 
               <div className="config-toolbar">
@@ -754,6 +1137,33 @@ function App() {
               </div>
             </details>
           ) : null}
+
+          <section className="panel compact-panel">
+            <div className="section-header compact-header">
+              <h2>分数榜</h2>
+              <p>得分 = 荣誉 + 卡牌分。</p>
+            </div>
+            <div className="scoreboard compact-scoreboard">
+              {scoreboardBySeat.map((entry) => (
+                <article
+                  key={entry.id}
+                  className={entry.id === currentPlayer.id ? 'score-card active' : 'score-card'}
+                >
+                  <header>
+                    <strong>{entry.name}</strong>
+                    <span>{entry.isAi ? '电脑' : '真人'}</span>
+                  </header>
+                  <div>得分 {entry.score}</div>
+                  <div>荣誉 {entry.honor}</div>
+                  <div>牌库 {entry.deckSize}</div>
+                  <div>神器 {entry.constructs}</div>
+                  <button type="button" onClick={() => setInspectPlayerId(entry.id)}>
+                    查看神器
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
 
           <section className="panel compact-panel">
             <div className="section-header compact-header">
@@ -827,33 +1237,6 @@ function App() {
             </div>
           </section>
 
-          <section className="panel compact-panel">
-            <div className="section-header compact-header">
-              <h2>分数榜</h2>
-              <p>得分 = 荣誉 + 所有已拥有卡牌的印刷荣誉。</p>
-            </div>
-            <div className="scoreboard compact-scoreboard">
-              {scoreboard.map((entry) => (
-                <article
-                  key={entry.id}
-                  className={entry.id === currentPlayer.id ? 'score-card active' : 'score-card'}
-                >
-                  <header>
-                    <strong>{entry.name}</strong>
-                    <span>{entry.isAi ? '电脑' : '真人'}</span>
-                  </header>
-                  <div>得分 {entry.score}</div>
-                  <div>荣誉 {entry.honor}</div>
-                  <div>牌库 {entry.deckSize}</div>
-                  <div>神器 {entry.constructs}</div>
-                  <button type="button" onClick={() => setInspectPlayerId(entry.id)}>
-                    查看神器
-                  </button>
-                </article>
-              ))}
-            </div>
-          </section>
-
           {inspectPlayerId ? (
             <section className="panel compact-panel">
               <div className="section-header compact-header">
@@ -891,9 +1274,23 @@ function App() {
               <p>最近的资源变化与电脑行动记录。</p>
             </div>
             <div className="log-list">
-              {game.log.map((entry, index) => (
-                <div key={`${entry}-${index}`} className="log-entry">
-                  {entry}
+              {parsedLog.map((entry, index) => (
+                <div
+                  key={`${entry.raw}-${index}`}
+                  className={`log-entry tone-${getActionTone(entry.action)} ${entry.actor ? 'is-structured' : ''}`}
+                >
+                  {entry.actor ? (
+                    <>
+                      <div className="log-entry-top">
+                        <span className={`headline-badge tone-${getActionTone(entry.action)}`}>{entry.label}</span>
+                        <strong>{entry.actor}</strong>
+                      </div>
+                      {entry.subject ? <div className="log-entry-target">{entry.subject}</div> : null}
+                      <div className="log-entry-raw">{entry.raw}</div>
+                    </>
+                  ) : (
+                    entry.raw
+                  )}
                 </div>
               ))}
             </div>
